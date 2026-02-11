@@ -1,4 +1,4 @@
-import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
+import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontSizeMap, toolCursorMap } from "./constants.js";
 import {
   cloneElement,
   findSnapPoint,
@@ -32,6 +32,11 @@ import {
   calculateResizeBounds,
 } from "./transforms.js";
 import { renderElement as renderElementPure } from "./renderers.js";
+import {
+  analyzeSelectionTypes,
+  buildSelectionPatch,
+  duplicateElements,
+} from "./selection.js";
 import type {
   ArrowheadStyle,
   Binding,
@@ -2025,52 +2030,17 @@ class DrawingController {
       this.selectedIds.add(id);
     }
 
-    // Update signal store BEFORE rendering handles (renderHandles reads from store)
+    const { hasLine, hasText } = analyzeSelectionTypes(this.selectedIds, this.elements);
     const patch: Partial<DrawingState> = {
       selected_ids: Array.from(this.selectedIds),
+      selected_is_line: hasLine,
+      selected_is_text: hasText,
     };
-
-    // Track selected element types for contextual toolbar controls
-    let hasLine = false;
-    let hasText = false;
-    for (const sid of this.selectedIds) {
-      const sel = this.elements.get(sid);
-      if (sel && (sel.type === "line" || sel.type === "arrow")) hasLine = true;
-      if (sel && sel.type === "text") hasText = true;
-    }
-    patch.selected_is_line = hasLine;
-    patch.selected_is_text = hasText;
 
     // Sync selected element's properties to toolbar signals
     if (this.selectedIds.size === 1) {
       const el = this.elements.get(Array.from(this.selectedIds)[0]);
-      if (el) {
-        patch.stroke_color = el.stroke_color;
-        patch.opacity = el.opacity;
-        if (el.type !== "text") {
-          patch.stroke_width = el.stroke_width;
-        }
-        if (typeof el.dash_length === "number") {
-          patch.dash_length = el.dash_length;
-        }
-        if (typeof el.dash_gap === "number") {
-          patch.dash_gap = el.dash_gap;
-        }
-        if (isShape(el)) {
-          if (el.fill_color) {
-            patch.fill_color = el.fill_color;
-          }
-        }
-        if (isLine(el)) {
-          patch.start_arrowhead = el.start_arrowhead || "none";
-          patch.end_arrowhead = el.end_arrowhead || "none";
-        }
-        if (isText(el)) {
-          patch.font_family = el.font_family;
-          patch.font_size = reverseFontSizeMap[el.font_size] ?? el.font_size;
-          patch.text_align = el.text_align;
-        }
-      }
+      if (el) Object.assign(patch, buildSelectionPatch(el));
     }
 
     this.callbacks.onStateChange(patch);
@@ -2154,26 +2124,15 @@ class DrawingController {
       }
     }
     this.updateSelectionVisual();
-    // Recompute selected_is_line / selected_is_text after filtering
-    let hasLine = false;
-    let hasText = false;
-    for (const sid of this.selectedIds) {
-      const sel = this.elements.get(sid);
-      if (sel && (sel.type === "line" || sel.type === "arrow")) hasLine = true;
-      if (sel && sel.type === "text") hasText = true;
-    }
+    const { hasLine, hasText } = analyzeSelectionTypes(this.selectedIds, this.elements);
     this.callbacks.onStateChange({ selected_ids: Array.from(this.selectedIds), selected_is_line: hasLine, selected_is_text: hasText });
   }
   selectAll(): void {
     this.selectedIds.clear();
-    let hasLine = false;
-    let hasText = false;
-    for (const [id, el] of this.elements) {
+    for (const id of this.elements.keys()) {
       this.selectedIds.add(id);
-      if (el.type === "line" || el.type === "arrow") hasLine = true;
-      if (el.type === "text") hasText = true;
     }
-    // Update signal store BEFORE rendering handles (renderHandles reads from store)
+    const { hasLine, hasText } = analyzeSelectionTypes(this.selectedIds, this.elements);
     this.callbacks.onStateChange({ selected_ids: Array.from(this.selectedIds), selected_is_line: hasLine, selected_is_text: hasText });
     this.updateSelectionVisual();
   }
@@ -2228,28 +2187,12 @@ class DrawingController {
   duplicateSelected(): void {
     if (this.selectedIds.size === 0) return;
 
+    const duplicates = duplicateElements(this.selectedIds, this.elements);
     const newIds: string[] = [];
-    for (const id of this.selectedIds) {
-      const original = this.elements.get(id);
-      if (!original) continue;
-
-      const newId = `${original.type}-${crypto.randomUUID().split("-")[0]}`;
-      const duplicate = { ...original, id: newId, created_at: Date.now() };
-
-      // Offset position
-      if ("x" in duplicate) {
-        (duplicate as any).x += 2;
-        (duplicate as any).y += 2;
-      } else if ("points" in duplicate) {
-        (duplicate as any).points = (duplicate as any).points.map((p: Point) => ({
-          x: p.x + 2,
-          y: p.y + 2,
-        }));
-      }
-
-      this.elements.set(newId, duplicate as DrawingElement);
-      this.undoStack.push({ action: "add", data: duplicate });
-      newIds.push(newId);
+    for (const dup of duplicates) {
+      this.elements.set(dup.id, dup);
+      this.undoStack.push({ action: "add", data: dup });
+      newIds.push(dup.id);
     }
 
     this.redoStack = [];
@@ -2259,7 +2202,6 @@ class DrawingController {
     this.selectedIds.clear();
     for (const id of newIds) this.selectedIds.add(id);
 
-    // Update signal store BEFORE rendering handles (renderHandles reads from store)
     this.callbacks.onStateChange({
       selected_ids: newIds,
       can_undo: true,
