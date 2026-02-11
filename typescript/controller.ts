@@ -17,8 +17,12 @@ import { renderElement as renderElementPure } from "./renderers.js";
 import type {
   ArrowheadStyle,
   Binding,
+  BoundingBox,
   DrawingConfig,
   DrawingElement,
+  DrawingState,
+  GroupResizeState,
+  GroupRotationState,
   Handle,
   HandleType,
   Layer,
@@ -26,7 +30,6 @@ import type {
   PathElement,
   Point,
   ShapeElement,
-
   TextElement,
   Tool,
   ToolSettings,
@@ -35,8 +38,8 @@ import type {
 import { isLine, isShape, isPath, isText } from "./types.js";
 
 export interface DrawingCallbacks {
-  onStateChange(patch: Record<string, unknown>): void;
-  getState(key: string): unknown;
+  onStateChange(patch: Partial<DrawingState>): void;
+  getState<K extends keyof DrawingState>(key: K): DrawingState[K];
 }
 
 // DrawingController class
@@ -47,8 +50,8 @@ class DrawingController {
 
   // State
   private elements: Map<string, DrawingElement> = new Map();
-  private undoStack: { action: string; data: any }[] = [];
-  private redoStack: { action: string; data: any }[] = [];
+  private undoStack: UndoAction[] = [];
+  private redoStack: UndoAction[] = [];
   private selectedIds: Set<string> = new Set();
 
   // Drawing state
@@ -80,22 +83,13 @@ class DrawingController {
 
   // Resize state
   private activeHandle: HandleType | null = null;
-  private resizeStartBounds: { x: number; y: number; width: number; height: number } | null = null;
+  private resizeStartBounds: BoundingBox | null = null;
   private resizeStartPoint: Point | null = null;
   private resizeElementId: string | null = null;
   private resizeOriginalFontSize: number | null = null;
   private resizeOriginalElement: DrawingElement | null = null;
 
-  // Group resize state (for multi-selection resize)
-  private groupResizeStart: {
-    elements: Array<{
-      id: string;
-      bounds: { x: number; y: number; width: number; height: number };
-      rotation: number;
-      originalElement: DrawingElement;
-    }>;
-    groupBounds: { x: number; y: number; width: number; height: number };
-  } | null = null;
+  private groupResizeStart: GroupResizeState | null = null;
 
   // Rotation state
   private rotationStartAngle = 0;
@@ -103,17 +97,7 @@ class DrawingController {
   private rotationElementId: string | null = null;
   private rotationOriginalElement: DrawingElement | null = null;
 
-  // Group rotation state (for multi-selection rotation)
-  private groupRotationStart: {
-    elements: Array<{
-      id: string;
-      position: Point;
-      rotation: number;
-      originalElement: DrawingElement;
-    }>;
-    center: Point;
-    startAngle: number;
-  } | null = null;
+  private groupRotationStart: GroupRotationState | null = null;
 
   // Per-tool settings memory
   private toolSettings: Map<Tool, ToolSettings> = new Map();
@@ -247,7 +231,7 @@ class DrawingController {
 
   private updateCursor(): void {
     if (!this.svg) return;
-    const tool = this.callbacks.getState("tool") as Tool;
+    const tool = this.callbacks.getState("tool");
 
     this.svg.style.cursor = toolCursorMap[tool] || "default";
   }
@@ -309,7 +293,7 @@ class DrawingController {
     // Refresh cached rect on each interaction (handles scroll/layout changes)
     this.updateSvgRect();
 
-    const tool = this.callbacks.getState("tool") as Tool;
+    const tool = this.callbacks.getState("tool");
     const point = this.pointerToSvgCoords(e);
 
     // Update cursor for non-select tools
@@ -479,12 +463,12 @@ class DrawingController {
     if (!rect) return;
 
     const isEditing = !!existingElement;
-    const fm = isEditing ? existingElement.font_family : (this.callbacks.getState("font_family") as TextElement["font_family"]);
+    const fm = isEditing ? existingElement.font_family : this.callbacks.getState("font_family");
     const rawFs = isEditing ? existingElement.font_size : this.callbacks.getState("font_size");
     // Resolve string presets ("small"/"medium"/"large") to numeric viewBox values
     const fs: number = typeof rawFs === "string" ? (fontSizeMap[rawFs] ?? 4) : (rawFs as number);
-    const ta = isEditing ? existingElement.text_align : (this.callbacks.getState("text_align") as TextElement["text_align"]);
-    const color = isEditing ? existingElement.stroke_color : (this.callbacks.getState("stroke_color") as string);
+    const ta = isEditing ? existingElement.text_align : this.callbacks.getState("text_align");
+    const color = isEditing ? existingElement.stroke_color : (this.callbacks.getState("stroke_color"));
 
     this.editingTextId = existingElement?.id ?? null;
     this.textEditSvgPoint = svgPoint;
@@ -594,9 +578,9 @@ class DrawingController {
       const rawFs = this.callbacks.getState("font_size");
       const fs: number = typeof rawFs === "string" ? (fontSizeMap[rawFs] ?? 4) : (rawFs as number);
       const ta = this.callbacks.getState("text_align") as TextElement["text_align"];
-      const color = this.callbacks.getState("stroke_color") as string;
-      const opacity = this.callbacks.getState("opacity") as number;
-      const layer = this.callbacks.getState("active_layer") as Layer;
+      const color = this.callbacks.getState("stroke_color");
+      const opacity = this.callbacks.getState("opacity");
+      const layer = this.callbacks.getState("active_layer");
 
       const textElement: TextElement = {
         id: `text-${crypto.randomUUID().split("-")[0]}`,
@@ -909,15 +893,15 @@ class DrawingController {
   }
 
   private startLineTool(point: Point): void {
-    const tool = this.callbacks.getState("tool") as Tool;
-    const strokeColor = this.callbacks.getState("stroke_color") as string;
-    const strokeWidth = this.callbacks.getState("stroke_width") as number;
-    const dashLength = (this.callbacks.getState("dash_length") as number) || 0;
-    const dashGap = (this.callbacks.getState("dash_gap") as number) || 0;
-    const opacity = this.callbacks.getState("opacity") as number;
-    const layer = this.callbacks.getState("active_layer") as Layer;
-    const startArrowhead = (this.callbacks.getState("start_arrowhead") as ArrowheadStyle) || "none";
-    const endArrowhead = (this.callbacks.getState("end_arrowhead") as ArrowheadStyle) || (tool === "arrow" ? "arrow" : "none");
+    const tool = this.callbacks.getState("tool");
+    const strokeColor = this.callbacks.getState("stroke_color");
+    const strokeWidth = this.callbacks.getState("stroke_width");
+    const dashLength = this.callbacks.getState("dash_length") || 0;
+    const dashGap = this.callbacks.getState("dash_gap") || 0;
+    const opacity = this.callbacks.getState("opacity");
+    const layer = this.callbacks.getState("active_layer");
+    const startArrowhead = this.callbacks.getState("start_arrowhead") || "none";
+    const endArrowhead = this.callbacks.getState("end_arrowhead") || (tool === "arrow" ? "arrow" : "none");
 
     // Snap start point to nearby endpoints/midpoints
     const snapResult = findSnapPoint(point, this.elements, SNAP_THRESHOLD);
@@ -950,15 +934,15 @@ class DrawingController {
   }
 
   private startShapeTool(point: Point): void {
-    const tool = this.callbacks.getState("tool") as Tool;
-    const strokeColor = this.callbacks.getState("stroke_color") as string;
-    const strokeWidth = this.callbacks.getState("stroke_width") as number;
-    const dashLength = (this.callbacks.getState("dash_length") as number) || 0;
-    const dashGap = (this.callbacks.getState("dash_gap") as number) || 0;
-    const fillColor = this.callbacks.getState("fill_color") as string;
-    const fillEnabled = this.callbacks.getState("fill_enabled") as boolean;
-    const opacity = this.callbacks.getState("opacity") as number;
-    const layer = this.callbacks.getState("active_layer") as Layer;
+    const tool = this.callbacks.getState("tool");
+    const strokeColor = this.callbacks.getState("stroke_color");
+    const strokeWidth = this.callbacks.getState("stroke_width");
+    const dashLength = this.callbacks.getState("dash_length") || 0;
+    const dashGap = this.callbacks.getState("dash_gap") || 0;
+    const fillColor = this.callbacks.getState("fill_color");
+    const fillEnabled = this.callbacks.getState("fill_enabled");
+    const opacity = this.callbacks.getState("opacity");
+    const layer = this.callbacks.getState("active_layer");
 
     this.isDrawing = true;
     this.anchorPoint = point;
@@ -1167,7 +1151,7 @@ class DrawingController {
     }
 
     // Update cursor based on hover state when using select tool
-    const tool = this.callbacks.getState("tool") as Tool;
+    const tool = this.callbacks.getState("tool");
     if (tool === "select" && this.svg) {
       const target = document.elementFromPoint(e.clientX, e.clientY) as SVGElement | null;
       const hoveredId = this.resolveElementId(target);
@@ -1923,9 +1907,16 @@ class DrawingController {
     }
   }
 
-  // Commit resize operation - push to undo stack
   private commitResize(): void {
-    // Handle group resize
+    // Collect IDs for bound-arrow update BEFORE nulling state
+    const resizedIds = new Set<string>();
+    if (this.groupResizeStart) {
+      for (const item of this.groupResizeStart.elements) resizedIds.add(item.id);
+    } else if (this.resizeElementId) {
+      resizedIds.add(this.resizeElementId);
+    }
+
+    // Push to undo stack
     if (this.groupResizeStart) {
       const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
       for (const item of this.groupResizeStart.elements) {
@@ -1939,22 +1930,13 @@ class DrawingController {
         }
       }
       if (undoItems.length > 0) {
-        this.undoStack.push({
-          action: "group-resize",
-          data: undoItems,
-        });
+        this.undoStack.push({ action: "group-resize", data: undoItems });
         this.redoStack = [];
-        this.callbacks.onStateChange({
-          can_undo: true,
-          can_redo: false,
-        });
+        this.callbacks.onStateChange({ can_undo: true, can_redo: false });
       }
-      this.groupResizeStart = null;
     } else if (this.resizeElementId && this.resizeOriginalElement) {
-      // Handle single element resize
       const element = this.elements.get(this.resizeElementId);
       if (element) {
-        // Store both original and current state for undo/redo
         this.undoStack.push({
           action: "resize",
           data: {
@@ -1964,20 +1946,10 @@ class DrawingController {
           },
         });
         this.redoStack = [];
-        this.callbacks.onStateChange({
-          can_undo: true,
-          can_redo: false,
-        });
+        this.callbacks.onStateChange({ can_undo: true, can_redo: false });
       }
     }
 
-    // Update arrows bound to resized elements
-    const resizedIds = new Set<string>();
-    if (this.groupResizeStart) {
-      for (const item of this.groupResizeStart.elements) resizedIds.add(item.id);
-    } else if (this.resizeElementId) {
-      resizedIds.add(this.resizeElementId);
-    }
     if (resizedIds.size > 0) this.updateBoundArrows(resizedIds);
 
     // Reset resize state
@@ -1987,6 +1959,7 @@ class DrawingController {
     this.resizeElementId = null;
     this.resizeOriginalFontSize = null;
     this.resizeOriginalElement = null;
+    this.groupResizeStart = null;
     this.snapTarget = null;
   }
 
@@ -2017,9 +1990,16 @@ class DrawingController {
     this.snapTarget = null;
   }
 
-  // Commit rotation operation - push to undo stack
   private commitRotation(): void {
-    // Handle group rotation
+    // Collect IDs for bound-arrow update BEFORE nulling state
+    const rotatedIds = new Set<string>();
+    if (this.groupRotationStart) {
+      for (const item of this.groupRotationStart.elements) rotatedIds.add(item.id);
+    } else if (this.rotationElementId) {
+      rotatedIds.add(this.rotationElementId);
+    }
+
+    // Push to undo stack
     if (this.groupRotationStart) {
       const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
       for (const item of this.groupRotationStart.elements) {
@@ -2033,22 +2013,13 @@ class DrawingController {
         }
       }
       if (undoItems.length > 0) {
-        this.undoStack.push({
-          action: "group-rotate",
-          data: undoItems,
-        });
+        this.undoStack.push({ action: "group-rotate", data: undoItems });
         this.redoStack = [];
-        this.callbacks.onStateChange({
-          can_undo: true,
-          can_redo: false,
-        });
+        this.callbacks.onStateChange({ can_undo: true, can_redo: false });
       }
-      this.groupRotationStart = null;
     } else if (this.rotationElementId && this.rotationOriginalElement) {
-      // Handle single element rotation
       const element = this.elements.get(this.rotationElementId);
       if (element) {
-        // Store both original and current state for undo/redo
         this.undoStack.push({
           action: "rotate",
           data: {
@@ -2058,20 +2029,10 @@ class DrawingController {
           },
         });
         this.redoStack = [];
-        this.callbacks.onStateChange({
-          can_undo: true,
-          can_redo: false,
-        });
+        this.callbacks.onStateChange({ can_undo: true, can_redo: false });
       }
     }
 
-    // Update arrows bound to rotated elements
-    const rotatedIds = new Set<string>();
-    if (this.groupRotationStart) {
-      for (const item of this.groupRotationStart.elements) rotatedIds.add(item.id);
-    } else if (this.rotationElementId) {
-      rotatedIds.add(this.rotationElementId);
-    }
     if (rotatedIds.size > 0) this.updateBoundArrows(rotatedIds);
 
     // Reset rotation state
@@ -2080,6 +2041,7 @@ class DrawingController {
     this.elementStartRotation = 0;
     this.rotationElementId = null;
     this.rotationOriginalElement = null;
+    this.groupRotationStart = null;
   }
 
   // Cancel rotation operation - restore original element
@@ -2122,7 +2084,7 @@ class DrawingController {
     const group = this.ensureHandlesGroup();
     group.innerHTML = ""; // Clear existing handles
 
-    const selectedIds = this.callbacks.getState("selected_ids") as string[];
+    const selectedIds = this.callbacks.getState("selected_ids");
     if (selectedIds.length === 0) return;
 
     // Get all selected elements
@@ -2494,10 +2456,10 @@ class DrawingController {
     const settings: ToolSettings = {};
 
     if (defaults.stroke_width !== undefined) {
-      settings.stroke_width = this.callbacks.getState("stroke_width") as number;
+      settings.stroke_width = this.callbacks.getState("stroke_width");
     }
     if (defaults.opacity !== undefined) {
-      settings.opacity = this.callbacks.getState("opacity") as number;
+      settings.opacity = this.callbacks.getState("opacity");
     }
     if (defaults.dash_length !== undefined) {
       settings.dash_length = this.callbacks.getState("dash_length") as number;
@@ -2516,7 +2478,7 @@ class DrawingController {
   }
 
   private loadToolSettings(settings: ToolSettings): void {
-    const patch: Record<string, unknown> = {};
+    const patch: Partial<DrawingState> = {};
 
     if (settings.stroke_width !== undefined) {
       patch.stroke_width = settings.stroke_width;
@@ -2749,12 +2711,12 @@ class DrawingController {
 
   // Action methods
   startDrawing(point: Point): void {
-    const tool = this.callbacks.getState("tool") as Tool;
-    const strokeColor = this.callbacks.getState("stroke_color") as string;
-    const strokeWidth = this.callbacks.getState("stroke_width") as number;
-    const opacity = this.callbacks.getState("opacity") as number;
+    const tool = this.callbacks.getState("tool");
+    const strokeColor = this.callbacks.getState("stroke_color");
+    const strokeWidth = this.callbacks.getState("stroke_width");
+    const opacity = this.callbacks.getState("opacity");
     const layer =
-      tool === "highlighter" ? "background" : (this.callbacks.getState("active_layer") as Layer);
+      tool === "highlighter" ? "background" : (this.callbacks.getState("active_layer"));
 
     this.isDrawing = true;
     this.currentPoints = [point];
@@ -2876,7 +2838,7 @@ class DrawingController {
     }
 
     // Update signal store BEFORE rendering handles (renderHandles reads from store)
-    const patch: Record<string, any> = {
+    const patch: Partial<DrawingState> = {
       selected_ids: Array.from(this.selectedIds),
     };
 

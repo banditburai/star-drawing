@@ -59,8 +59,8 @@ export interface LineElement extends BaseElement {
   start_arrowhead: ArrowheadStyle;
   end_arrowhead: ArrowheadStyle;
   midpoint?: Point; // Optional bezier control point for curved lines
-  startBinding?: Binding;
-  endBinding?: Binding;
+  startBinding?: Binding | undefined;
+  endBinding?: Binding | undefined;
 }
 
 // Binding for connecting arrows to shapes
@@ -145,8 +145,59 @@ export interface DrawingConfig {
   throttleMs: number;
 }
 
+// Resize handle types (subset of HandleType, excludes rotation/start/end/midpoint)
+export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+
 // Position types for move operations
 export type MovePosition = { x: number; y: number } | { points: Point[]; midpoint?: Point };
+
+// State contract between TypeScript controller and host framework (e.g. Datastar signals)
+export interface DrawingState {
+  tool: Tool;
+  is_drawing: boolean;
+  can_undo: boolean;
+  can_redo: boolean;
+  text_editing: boolean;
+  stroke_color: string;
+  fill_color: string;
+  fill_enabled: boolean;
+  stroke_width: number;
+  dash_length: number;
+  dash_gap: number;
+  opacity: number;
+  selected_ids: string[];
+  active_layer: Layer;
+  font_family: TextElement["font_family"];
+  font_size: string | number;
+  text_align: TextElement["text_align"];
+  start_arrowhead: ArrowheadStyle;
+  end_arrowhead: ArrowheadStyle;
+  selected_is_line: boolean;
+  selected_is_text: boolean;
+}
+
+// Group resize state for multi-selection resize
+export interface GroupResizeState {
+  elements: Array<{
+    id: string;
+    bounds: BoundingBox;
+    rotation: number;
+    originalElement: DrawingElement;
+  }>;
+  groupBounds: BoundingBox;
+}
+
+// Group rotation state for multi-selection rotation
+export interface GroupRotationState {
+  elements: Array<{
+    id: string;
+    position: Point;
+    rotation: number;
+    originalElement: DrawingElement;
+  }>;
+  center: Point;
+  startAngle: number;
+}
 
 // Undo/Redo action types (discriminated union for type safety)
 export type UndoAction =
