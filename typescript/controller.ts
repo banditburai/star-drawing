@@ -13,6 +13,12 @@ import {
 } from "./geometry.js";
 import type { SnapResult } from "./geometry.js";
 import { processRedo, processUndo } from "./history.js";
+import {
+  applyGroupResize,
+  applyGroupRotation,
+  applyResize,
+  calculateResizeBounds,
+} from "./transforms.js";
 import { renderElement as renderElementPure } from "./renderers.js";
 import type {
   ArrowheadStyle,
@@ -29,6 +35,7 @@ import type {
   LineElement,
   PathElement,
   Point,
+  ResizeHandleType,
   ShapeElement,
   TextElement,
   Tool,
@@ -1004,7 +1011,7 @@ class DrawingController {
           currentAngle = this.groupRotationStart.startAngle + snappedDelta;
         }
 
-        this.applyGroupRotation(currentAngle);
+        applyGroupRotation(currentAngle, this.groupRotationStart, this.elements);
         const groupRotIds = new Set(this.groupRotationStart.elements.map(item => item.id));
         this.updateBoundArrows(groupRotIds);
         this.rerenderElements();
@@ -1121,25 +1128,27 @@ class DrawingController {
         ? this.elements.get(this.resizeElementId)?.type === "text"
         : false;
 
-      const newBounds = this.calculateResizeBounds(
-        this.activeHandle,
-        this.resizeStartBounds,
+      const newBounds = calculateResizeBounds({
+        handleType: this.activeHandle as ResizeHandleType,
+        startBounds: this.resizeStartBounds,
         dx, dy,
         rotation,
-        e.shiftKey || isTextElement, // maintain aspect ratio (forced for text)
-        e.altKey // resize from center
-      );
+        maintainAspectRatio: e.shiftKey || isTextElement,
+        resizeFromCenter: e.altKey,
+      });
 
       if (this.groupResizeStart) {
-        // Group resize
-        this.applyGroupResize(newBounds);
+        applyGroupResize(newBounds, this.groupResizeStart, this.elements);
         const resIds = new Set(this.groupResizeStart.elements.map(item => item.id));
         this.updateBoundArrows(resIds);
       } else if (this.resizeElementId) {
-        // Single element resize
         const element = this.elements.get(this.resizeElementId);
         if (element) {
-          this.applyResize(element, newBounds);
+          // Capture original font size on first resize call (prevents drift)
+          if (isTextElement && this.resizeOriginalFontSize === null) {
+            this.resizeOriginalFontSize = (element as TextElement).font_size;
+          }
+          applyResize(element, newBounds, this.resizeStartBounds, this.resizeOriginalElement, this.resizeOriginalFontSize);
         }
         this.updateBoundArrows(new Set([this.resizeElementId]));
       }
@@ -1308,87 +1317,6 @@ class DrawingController {
     return result?.element ?? null;
   }
 
-  // Set element position (center point for shapes, start point for text/lines)
-  private setElementPosition(el: DrawingElement, newPos: Point): void {
-    if (isShape(el)) {
-      const bbox = getBoundingBox(el);
-      // newPos is center, convert to top-left
-      el.x = newPos.x - bbox.width / 2;
-      el.y = newPos.y - bbox.height / 2;
-    } else if (isText(el)) {
-      // For text, position is the anchor point (use center of bounding box)
-      const bbox = getBoundingBox(el);
-      el.x = newPos.x - bbox.width / 2;
-      el.y = newPos.y - bbox.height / 2;
-    } else if (isLine(el)) {
-      const bbox = getBoundingBox(el);
-      const oldCenterX = bbox.x + bbox.width / 2;
-      const oldCenterY = bbox.y + bbox.height / 2;
-      const dx = newPos.x - oldCenterX;
-      const dy = newPos.y - oldCenterY;
-      el.points = el.points.map((p) => ({
-        x: p.x + dx,
-        y: p.y + dy,
-      })) as [Point, Point];
-      if (el.midpoint) {
-        el.midpoint = {
-          x: el.midpoint.x + dx,
-          y: el.midpoint.y + dy,
-        };
-      }
-    } else if (isPath(el)) {
-      const path = el;
-      const bbox = getBoundingBox(el);
-      const oldCenterX = bbox.x + bbox.width / 2;
-      const oldCenterY = bbox.y + bbox.height / 2;
-      const dx = newPos.x - oldCenterX;
-      const dy = newPos.y - oldCenterY;
-      path.points = path.points.map((p) => ({
-        x: p.x + dx,
-        y: p.y + dy,
-      }));
-    }
-  }
-
-  // Apply group rotation - rotates all elements around group center
-  private applyGroupRotation(newAngle: number): void {
-    if (!this.groupRotationStart) return;
-
-    const deltaAngle = newAngle - this.groupRotationStart.startAngle;
-    const center = this.groupRotationStart.center;
-
-    for (const item of this.groupRotationStart.elements) {
-      const el = this.elements.get(item.id);
-      if (!el) continue;
-
-      // Lines/arrows: bake rotation into point positions (no rotation transform)
-      if (isLine(el)) {
-        const origLine = item.originalElement as LineElement;
-        // Rotate endpoints around group center
-        el.points = [
-          rotatePoint(origLine.points[0], center, deltaAngle),
-          rotatePoint(origLine.points[1], center, deltaAngle),
-        ];
-        // Rotate midpoint if it exists
-        if (origLine.midpoint) {
-          el.midpoint = rotatePoint(origLine.midpoint, center, deltaAngle);
-        }
-        // Lines don't use rotation property - keep it at 0
-        el.rotation = 0;
-      } else if (isPath(el)) {
-        // Paths: bake rotation into all points
-        const origPath = item.originalElement as PathElement;
-        el.points = origPath.points.map((p) => rotatePoint(p, center, deltaAngle));
-        // Paths don't use rotation property - keep it at 0
-        el.rotation = 0;
-      } else {
-        // Shapes and text: use rotation property
-        const newPos = rotatePoint(item.position, center, deltaAngle);
-        this.setElementPosition(el, newPos);
-        el.rotation = item.rotation + deltaAngle;
-      }
-    }
-  }
 
   // Get handle positions for selection manipulation
   getHandlePositions(el: DrawingElement): Handle[] {
@@ -1506,406 +1434,6 @@ class DrawingController {
     return handles.find((h) => h.type === handleType) || null;
   }
 
-  /**
-   * Get the fixed corner in local (unrotated) space for a given handle.
-   *
-   * CORNER handles (nw/ne/se/sw): the diagonally opposite corner.
-   *
-   * EDGE handles (n/s/e/w): a corner on the fixed (opposite) edge.
-   * This is the "corner-pair decomposition" — every edge drag is reduced
-   * to a pair of diagonally-opposite corners so the same Preet Shihn
-   * unrotate maths can be applied uniformly. Using a true corner (not an
-   * edge midpoint) ensures the pair always spans both axes, avoiding the
-   * single-axis collapse that breaks the original midpoint algorithm.
-   */
-  private getFixedCorner(
-    handleType: HandleType,
-    bounds: { x: number; y: number; width: number; height: number }
-  ): Point {
-    const { x, y, width, height } = bounds;
-    switch (handleType) {
-      // Corner handles: diagonally opposite corner
-      case "nw": return { x: x + width, y: y + height }; // SE
-      case "ne": return { x, y: y + height };             // SW
-      case "se": return { x, y };                         // NW
-      case "sw": return { x: x + width, y };              // NE
-
-      // Edge handles: a corner on the fixed (opposite) edge
-      case "n":  return { x, y: y + height };             // SW  (south edge fixed)
-      case "s":  return { x, y };                         // NW  (north edge fixed)
-      case "e":  return { x, y };                         // NW  (west edge fixed)
-      case "w":  return { x: x + width, y };              // NE  (east edge fixed)
-      default:   return { x: x + width / 2, y: y + height / 2 };
-    }
-  }
-
-  /**
-   * Rotation-aware resize using the "corner-pair" approach.
-   *
-   * OVERVIEW
-   * --------
-   * Every resize — whether from a corner or an edge handle — is reduced
-   * to two diagonally-opposite corners in screen space so the Preet Shihn
-   * algorithm can be applied uniformly.
-   *
-   * CORNER HANDLES (nw / ne / se / sw)
-   *   Fixed corner  = diagonally opposite corner (rotated to screen space).
-   *   Moving corner = the handle's own corner + mouse delta.
-   *   Preet Shihn works directly: center = midpoint, unrotate, extract bounds.
-   *
-   * EDGE HANDLES (n / s / e / w)  —  the core of this algorithm
-   *   The naive Preet Shihn approach uses the opposite edge *midpoint* as
-   *   the fixed point. When you unrotate a midpoint pair that shares one
-   *   local-space axis, one dimension collapses to zero.
-   *
-   *   Fix: pick a CORNER on the fixed edge as anchor, and construct the
-   *   "virtual moving corner" diagonally opposite it. Only the
-   *   constrained axis of the moving corner changes (y for n/s, x for
-   *   e/w); the free axis stays at its original value, preserving the
-   *   unconstrained dimension exactly.
-   *
-   *   Example — "s" handle on a 20x20 rect at (40,40):
-   *     Fixed corner  = NW (40, 40)        — on the north edge
-   *     Moving corner = SE (60, 60)        — diag-opposite of NW
-   *     Mouse drags south edge down by localDy, so SE becomes (60, 60+localDy).
-   *     Width (from NW.x to SE.x = 40 to 60 = 20) is preserved.
-   *
-   * ALGORITHM
-   *   Step 1: Rotate the screen-space drag delta (dx, dy) by -rotation
-   *           into element-local space → (localDx, localDy).
-   *
-   *   Step 2: Apply (localDx, localDy) to the bounds as if unrotated.
-   *           Each handle type contributes local delta to the relevant
-   *           edges (e.g. "e" adds localDx to width, "nw" subtracts
-   *           localDx from width and localDy from height).
-   *
-   *   Step 3: Drift compensation. After step 2 the bounds' center has
-   *           shifted. Since SVG applies rotation as rotate(θ, cx, cy),
-   *           the fixed corner drifts in screen space. We compute the
-   *           drift and compensate so the fixed corner stays pinned.
-   *
-   *           The compensation is exact — algebraically:
-   *             rotatePoint(anchorNew, newCenterCorrected, θ)
-   *               === rotatePoint(anchorOld, oldCenter, θ)
-   *           for ANY point on the fixed edge, not just the chosen corner.
-   */
-  private calculateResizeBounds(
-    handleType: HandleType,
-    startBounds: { x: number; y: number; width: number; height: number },
-    dx: number,  // screen-space delta from drag start
-    dy: number,  // screen-space delta from drag start
-    rotation: number,  // element rotation in degrees
-    maintainAspectRatio: boolean,
-    resizeFromCenter: boolean
-  ): { x: number; y: number; width: number; height: number } {
-    // Non-resize handles — return unchanged bounds
-    if (handleType === "rotation" || handleType === "start" || handleType === "end" || handleType === "midpoint") {
-      return startBounds;
-    }
-
-    // ── Step 1: Rotate screen delta into local (unrotated) space ──
-    const rad = (-rotation * Math.PI) / 180;
-    const cosR = Math.cos(rad);
-    const sinR = Math.sin(rad);
-    const localDx = dx * cosR - dy * sinR;
-    const localDy = dx * sinR + dy * cosR;
-
-    // ── Step 2: Apply local delta per handle ──
-    //
-    // Each handle moves one or two edges in local space.
-    // Edge handles move only the constrained edge; corner handles
-    // move both edges adjacent to the dragged corner.
-    let { x, y, width, height } = startBounds;
-
-    switch (handleType) {
-      // Corner handles: both axes
-      case "se":
-        width  += localDx;
-        height += localDy;
-        break;
-      case "sw":
-        x      += localDx;
-        width  -= localDx;
-        height += localDy;
-        break;
-      case "ne":
-        width  += localDx;
-        y      += localDy;
-        height -= localDy;
-        break;
-      case "nw":
-        x      += localDx;
-        width  -= localDx;
-        y      += localDy;
-        height -= localDy;
-        break;
-
-      // Edge handles: single axis (the other dimension is preserved)
-      case "s":
-        height += localDy;
-        break;
-      case "n":
-        y      += localDy;
-        height -= localDy;
-        break;
-      case "e":
-        width  += localDx;
-        break;
-      case "w":
-        x      += localDx;
-        width  -= localDx;
-        break;
-    }
-
-    // ── Maintain aspect ratio ──
-    if (maintainAspectRatio && startBounds.width > 0 && startBounds.height > 0) {
-      const aspect = startBounds.width / startBounds.height;
-      const isVerticalOnly  = handleType === "n" || handleType === "s";
-      const isHorizontalOnly = handleType === "e" || handleType === "w";
-
-      let targetW = width;
-      let targetH = height;
-
-      if (isVerticalOnly) {
-        targetW = targetH * aspect;          // height drove the change
-      } else if (isHorizontalOnly) {
-        targetH = targetW / aspect;          // width drove the change
-      } else {
-        // Corner: lock to whichever dimension changed more
-        if (width / height > aspect) {
-          targetH = targetW / aspect;
-        } else {
-          targetW = targetH * aspect;
-        }
-      }
-
-      const dw = targetW - width;
-      const dh = targetH - height;
-
-      // Anchor the correct edge(s)
-      if (handleType.includes("w"))  x -= dw;
-      if (handleType.includes("n"))  y -= dh;
-
-      // For pure-edge handles, center extra size on the free axis
-      if (isVerticalOnly)   x -= dw / 2;
-      if (isHorizontalOnly) y -= dh / 2;
-
-      width  = targetW;
-      height = targetH;
-    }
-
-    // ── Handle resize-from-center (Alt key) ──
-    // Center stays fixed → no drift compensation needed.
-    if (resizeFromCenter) {
-      const origCenter: Point = {
-        x: startBounds.x + startBounds.width / 2,
-        y: startBounds.y + startBounds.height / 2,
-      };
-      width  = Math.max(width, 1);
-      height = Math.max(height, 1);
-      return {
-        x: origCenter.x - width / 2,
-        y: origCenter.y - height / 2,
-        width,
-        height,
-      };
-    }
-
-    // ── Enforce minimum size ──
-    if (width < 1) {
-      if (handleType.includes("w")) x += width - 1;
-      width = 1;
-    }
-    if (height < 1) {
-      if (handleType.includes("n")) y += height - 1;
-      height = 1;
-    }
-
-    // ── Step 3: Drift compensation (corner-pair invariant) ──
-    //
-    // The fixed corner must stay at the same screen position before
-    // and after the resize.  Because the bounds' center shifted, the
-    // rotation pivot changed, which drifts the fixed corner on screen.
-    //
-    // We use getFixedCorner (always a true corner, never an edge
-    // midpoint) so the {fixedCorner, movingCorner} pair spans both
-    // axes — this is the essence of the corner-pair decomposition.
-    //
-    // Proof that the correction is exact:
-    //   Let F = fixedLocal, C = oldCenter, C' = newCenter, R = rotation.
-    //   correction = rotatePoint(F, C, R) - rotatePoint(F, C', R)
-    //   After shifting bounds by correction:
-    //     F_new = F + correction,  C'_new = C' + correction
-    //     rotatePoint(F_new, C'_new, R) = rotatePoint(F, C, R)  ∎
-    //   (The relative offset F-C' is unchanged, so the rotation result
-    //   shifts by exactly 'correction', cancelling the drift.)
-
-    if (rotation !== 0) {
-      const oldCenter: Point = {
-        x: startBounds.x + startBounds.width / 2,
-        y: startBounds.y + startBounds.height / 2,
-      };
-      const fixedLocal = this.getFixedCorner(handleType, startBounds);
-      const fixedScreen = rotatePoint(fixedLocal, oldCenter, rotation);
-
-      const newCenter: Point = { x: x + width / 2, y: y + height / 2 };
-      const fixedLocalAfter = this.getFixedCorner(handleType, { x, y, width, height });
-      const fixedScreenAfter = rotatePoint(fixedLocalAfter, newCenter, rotation);
-
-      x += fixedScreen.x - fixedScreenAfter.x;
-      y += fixedScreen.y - fixedScreenAfter.y;
-    }
-
-    return { x, y, width, height };
-  }
-
-  // Apply resize to an element
-  private applyResize(
-    element: DrawingElement,
-    newBounds: { x: number; y: number; width: number; height: number }
-  ): void {
-    // Early return if startBounds not set (required for text/line/path scaling)
-    const startBounds = this.resizeStartBounds;
-
-    if (isShape(element)) {
-      element.x = newBounds.x;
-      element.y = newBounds.y;
-      element.width = newBounds.width;
-      element.height = newBounds.height;
-    } else if (isText(element)) {
-      if (!startBounds) return;
-      // Store original font size on first resize call
-      if (!this.resizeOriginalFontSize) {
-        this.resizeOriginalFontSize = element.font_size;
-      }
-      // Scale font size proportionally
-      const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
-      const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-      const scale = Math.max(scaleX, scaleY);
-      element.font_size = Math.max(0.5, this.resizeOriginalFontSize * scale);
-      // Derive text anchor position from the bbox based on alignment
-      // bbox.x is the visual left edge; element.x is the anchor point
-      element.y = newBounds.y;
-      if (element.text_align === "center") {
-        element.x = newBounds.x + newBounds.width / 2;
-      } else if (element.text_align === "right") {
-        element.x = newBounds.x + newBounds.width;
-      } else {
-        element.x = newBounds.x;
-      }
-    } else if (isLine(element)) {
-      if (!startBounds) return;
-      // Use original element's points to avoid cumulative drift from repeated transforms
-      const origLine = this.resizeOriginalElement as LineElement | null;
-      if (!origLine) return;
-
-      const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
-      const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-
-      element.points = origLine.points.map((p) => ({
-        x: newBounds.x + (p.x - startBounds.x) * scaleX,
-        y: newBounds.y + (p.y - startBounds.y) * scaleY,
-      })) as [Point, Point];
-    } else if (isPath(element)) {
-      if (!startBounds) return;
-      // Use original element's points to avoid cumulative drift from repeated transforms
-      const origPath = this.resizeOriginalElement as PathElement | null;
-      if (!origPath) return;
-
-      const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
-      const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-
-      element.points = origPath.points.map((p) => ({
-        x: newBounds.x + (p.x - startBounds.x) * scaleX,
-        y: newBounds.y + (p.y - startBounds.y) * scaleY,
-      }));
-    }
-  }
-
-  // Set element bounds (used by group resize)
-  private setElementBounds(
-    el: DrawingElement,
-    newBounds: { x: number; y: number; width: number; height: number },
-    originalBounds: { x: number; y: number; width: number; height: number }
-  ): void {
-    if (isShape(el)) {
-      el.x = newBounds.x;
-      el.y = newBounds.y;
-      el.width = newBounds.width;
-      el.height = newBounds.height;
-    } else if (isText(el)) {
-      el.x = newBounds.x;
-      el.y = newBounds.y;
-      // Scale font size proportionally
-      const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-      const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-      const scale = Math.max(scaleX, scaleY);
-      // Get original font size from the stored element
-      const originalItem = this.groupResizeStart?.elements.find((item) => item.id === el.id);
-      if (originalItem) {
-        const origText = originalItem.originalElement as TextElement;
-        el.font_size = Math.max(0.5, origText.font_size * scale);
-      }
-    } else if (isLine(el)) {
-      // Scale line endpoints proportionally
-      const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-      const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-      const originalItem = this.groupResizeStart?.elements.find((item) => item.id === el.id);
-      if (originalItem) {
-        const origLine = originalItem.originalElement as LineElement;
-        el.points = origLine.points.map((p) => ({
-          x: newBounds.x + (p.x - originalBounds.x) * scaleX,
-          y: newBounds.y + (p.y - originalBounds.y) * scaleY,
-        })) as [Point, Point];
-      }
-    } else if (isPath(el)) {
-      // Scale all points proportionally
-      const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-      const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-      const originalItem = this.groupResizeStart?.elements.find((item) => item.id === el.id);
-      if (originalItem) {
-        const origPath = originalItem.originalElement as PathElement;
-        el.points = origPath.points.map((p) => ({
-          x: newBounds.x + (p.x - originalBounds.x) * scaleX,
-          y: newBounds.y + (p.y - originalBounds.y) * scaleY,
-        }));
-      }
-    }
-  }
-
-  // Apply group resize - scales all elements proportionally
-  private applyGroupResize(newGroupBounds: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }): void {
-    if (!this.groupResizeStart) return;
-
-    const oldBounds = this.groupResizeStart.groupBounds;
-    const scaleX = oldBounds.width > 0 ? newGroupBounds.width / oldBounds.width : 1;
-    const scaleY = oldBounds.height > 0 ? newGroupBounds.height / oldBounds.height : 1;
-
-    for (const item of this.groupResizeStart.elements) {
-      const el = this.elements.get(item.id);
-      if (!el) continue;
-
-      // Scale position relative to group origin
-      const relX = (item.bounds.x - oldBounds.x) * scaleX;
-      const relY = (item.bounds.y - oldBounds.y) * scaleY;
-
-      // Calculate new bounds for this element
-      const newElementBounds = {
-        x: newGroupBounds.x + relX,
-        y: newGroupBounds.y + relY,
-        width: item.bounds.width * scaleX,
-        height: item.bounds.height * scaleY,
-      };
-
-      // Apply new position and scaled dimensions
-      this.setElementBounds(el, newElementBounds, item.bounds);
-    }
-  }
 
   private commitResize(): void {
     // Collect IDs for bound-arrow update BEFORE nulling state
