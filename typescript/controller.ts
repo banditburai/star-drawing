@@ -49,6 +49,7 @@ import type {
   HandleType,
   Layer,
   LineElement,
+  MovePosition,
   PathElement,
   Point,
   ResizeHandleType,
@@ -65,77 +66,62 @@ export interface DrawingCallbacks {
   getState<K extends keyof DrawingState>(key: K): DrawingState[K];
 }
 
-// DrawingController class
 class DrawingController {
   private container: HTMLElement;
   private config: DrawingConfig;
   private callbacks: DrawingCallbacks;
 
-  // State
   private elements: Map<string, DrawingElement> = new Map();
   private undoStack: UndoAction[] = [];
   private redoStack: UndoAction[] = [];
   private selectedIds: Set<string> = new Set();
 
-  // Drawing state
   private isDrawing = false;
   private currentElement: DrawingElement | null = null;
   private currentPoints: Point[] = [];
   private anchorPoint: Point | null = null;
 
-  // Drag state for moving selected elements
   private isDragging = false;
   private dragStartPoint: Point | null = null;
   private dragStartPositions: Map<string, { x: number; y: number; points?: Point[]; midpoint?: Point | undefined }> = new Map();
 
-  // Snap state for endpoint snapping
   private snapTarget: Point | null = null;
   private lastSnapResult: SnapResult | null = null;
 
-  // Eraser state
   private isErasing = false;
 
-  // Text editing state
   private textEdit: TextEditState | null = null;
   private lastClickTime = 0;
   private lastClickId: string | null = null;
 
-  // Resize state
   private activeHandle: HandleType | null = null;
   private resizeStartBounds: BoundingBox | null = null;
   private resizeStartPoint: Point | null = null;
   private resizeElementId: string | null = null;
   private resizeOriginalFontSize: number | null = null;
   private resizeOriginalElement: DrawingElement | null = null;
-
   private groupResizeStart: GroupResizeState | null = null;
 
-  // Rotation state
   private rotationStartAngle = 0;
   private elementStartRotation = 0;
   private rotationElementId: string | null = null;
   private rotationOriginalElement: DrawingElement | null = null;
-
   private groupRotationStart: GroupRotationState | null = null;
 
-  // Per-tool settings memory
   private toolSettings: Map<Tool, ToolSettings> = new Map();
   private currentTool: Tool = "select";
 
-  // SVG elements
   private svg: SVGSVGElement | null = null;
   private elementsGroup: SVGGElement | null = null;
   private previewGroup: SVGGElement | null = null;
   private handlesGroup: SVGGElement | null = null;
 
-  // Bound event handlers (stored for cleanup)
   private boundPointerDown: ((e: PointerEvent) => void) | null = null;
   private boundPointerMove: ((e: PointerEvent) => void) | null = null;
   private boundPointerUp: ((e: PointerEvent) => void) | null = null;
   private boundPointerCancel: ((e: PointerEvent) => void) | null = null;
   private boundKeyDown: ((e: KeyboardEvent) => void) | null = null;
 
-  // Preview rendering state
   private pendingRender = false;
 
   // Cached SVG rect for performance during continuous pointer movement
@@ -151,15 +137,11 @@ class DrawingController {
   }
 
   private init(): void {
-    // Initialize per-tool settings with defaults
     for (const [tool, defaults] of Object.entries(TOOL_DEFAULTS)) {
       this.toolSettings.set(tool as Tool, { ...defaults });
     }
 
-    // Set current tool from config
     this.currentTool = this.config.defaultTool;
-
-    // Get the default tool's settings (cast to ToolSettings for type safety)
     const defaultToolSettings: ToolSettings =
       this.toolSettings.get(this.currentTool) ?? TOOL_DEFAULTS[this.currentTool];
 
@@ -191,8 +173,6 @@ class DrawingController {
   }
 
   private createSvgLayer(): void {
-    const container = this.container;
-
     this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     this.svg.setAttribute("class", "drawing-svg");
     this.svg.setAttribute("viewBox", "0 0 100 100");
@@ -209,7 +189,7 @@ class DrawingController {
     this.previewGroup.setAttribute("class", "preview");
     this.svg.appendChild(this.previewGroup);
 
-    container.appendChild(this.svg);
+    this.container.appendChild(this.svg);
 
     // Set up ResizeObserver to cache SVG rect (avoids getBoundingClientRect on every mouse move)
     this.updateSvgRect();
@@ -244,7 +224,6 @@ class DrawingController {
     this.svg.addEventListener("pointercancel", this.boundPointerCancel);
     document.addEventListener("keydown", this.boundKeyDown);
 
-    // Update cursor based on tool changes
     this.updateCursor();
   }
 
@@ -269,7 +248,6 @@ class DrawingController {
       return;
     }
 
-    // Escape: deselect all
     if (e.key === "Escape") {
       if (this.selectedIds.size > 0) {
         e.preventDefault();
@@ -314,12 +292,10 @@ class DrawingController {
     const tool = this.callbacks.getState("tool");
     const point = this.pointerToSvgCoords(e);
 
-    // Update cursor for non-select tools
     if (tool !== "select") {
       this.updateCursor();
     }
 
-    // Check for handle click when using select tool with a selection
     if (tool === "select" && this.selectedIds.size > 0) {
       const handle = hitTestHandle(e.clientX, e.clientY, this.selectedIds, this.elements);
       if (handle) {
@@ -327,9 +303,7 @@ class DrawingController {
         this.svg?.setPointerCapture(e.pointerId);
         this.activeHandle = handle.type;
 
-        // Check if multiple elements are selected
         if (this.selectedIds.size > 1) {
-          // Initialize group resize/rotate state
           const selectedElements: DrawingElement[] = [];
           for (const id of this.selectedIds) {
             const el = this.elements.get(id);
@@ -337,7 +311,6 @@ class DrawingController {
           }
 
           if (handle.type === "rotation") {
-            // Initialize group rotation state
             const groupBounds = getGroupBoundingBox(selectedElements);
             const groupCenter: Point = {
               x: groupBounds.x + groupBounds.width / 2,
@@ -360,7 +333,6 @@ class DrawingController {
             };
             this.rotationStartAngle = startAngle;
           } else {
-            // Initialize group resize state
             const groupBounds = getGroupBoundingBox(selectedElements);
             this.groupResizeStart = {
               elements: selectedElements.map((el) => ({
@@ -375,19 +347,16 @@ class DrawingController {
             this.resizeStartPoint = point;
           }
         } else {
-          // Single element resize/rotate
           const selectedId = Array.from(this.selectedIds)[0];
           const element = this.elements.get(selectedId);
           if (element) {
             if (handle.type === "rotation") {
-              // Initialize rotation state
               const center = getElementCenter(element);
               this.rotationStartAngle = getAngleFromPoint(point, center);
               this.elementStartRotation = element.rotation;
               this.rotationElementId = selectedId;
               this.rotationOriginalElement = cloneElement(element);
             } else {
-              // Initialize resize state
               this.resizeStartBounds = getBoundingBox(element);
               this.resizeStartPoint = point;
               this.resizeElementId = selectedId;
@@ -433,7 +402,6 @@ class DrawingController {
       const target = document.elementFromPoint(e.clientX, e.clientY) as SVGElement | null;
       const clickedId = this.resolveElementId(target);
 
-      // Double-click to edit existing text elements
       const now = Date.now();
       if (clickedId && clickedId === this.lastClickId && now - this.lastClickTime < 400) {
         const el = this.elements.get(clickedId);
@@ -447,17 +415,15 @@ class DrawingController {
       this.lastClickTime = now;
       this.lastClickId = clickedId;
 
-      // If clicking on an already-selected element, start dragging
       if (clickedId && this.selectedIds.has(clickedId)) {
         this.svg?.setPointerCapture(e.pointerId);
         this.startDragging(point);
         return;
       }
 
-      // Otherwise, select (or add to selection with shift)
       this.selectAtPoint(e.clientX, e.clientY, e.shiftKey);
 
-      // If we selected something and it's the only selection, start dragging immediately
+      // Start dragging immediately on single-select
       if (clickedId && this.selectedIds.has(clickedId)) {
         this.svg?.setPointerCapture(e.pointerId);
         this.startDragging(point);
@@ -600,7 +566,6 @@ class DrawingController {
         can_redo: false,
       });
 
-      // Auto-switch to select tool and select the new text
       this.switchTool("select");
       this.selectElement(textElement.id, false);
     }
@@ -652,7 +617,6 @@ class DrawingController {
     this.dragStartPoint = point;
     this.dragStartPositions.clear();
 
-    // Store original positions for all selected elements
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el) continue;
@@ -691,7 +655,6 @@ class DrawingController {
       }
     }
 
-    // Change cursor to grabbing
     if (this.svg) {
       this.svg.style.cursor = "grabbing";
     }
@@ -703,7 +666,6 @@ class DrawingController {
     const dx = point.x - this.dragStartPoint.x;
     const dy = point.y - this.dragStartPoint.y;
 
-    // Update positions of all selected elements
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       const startPos = this.dragStartPositions.get(id);
@@ -732,7 +694,6 @@ class DrawingController {
       }
     }
 
-    // Update arrows bound to moved shapes
     this.updateBoundArrows(this.selectedIds);
     this.rerenderElements();
   }
@@ -740,9 +701,7 @@ class DrawingController {
   private commitDragging(): void {
     if (!this.isDragging) return;
 
-    // Push move action to undo stack (store before/after positions)
-    const moveData: { id: string; before: any; after: any }[] = [];
-    // Include both selected elements and bound arrows
+    const moveData: Array<{ id: string; before: MovePosition; after: MovePosition }> = [];
     for (const [id, startPos] of this.dragStartPositions) {
       const el = this.elements.get(id);
       if (!el || !startPos) continue;
@@ -827,7 +786,6 @@ class DrawingController {
     // Remove the top-level DOM element (may be a <g> group, not the hit child)
     this.elementsGroup?.querySelector(`#${id}`)?.remove();
 
-    // Clear bindings referencing deleted element
     for (const [, el] of this.elements) {
       if (isLine(el)) {
         if (el.startBinding?.elementId === id) el.startBinding = undefined;
@@ -835,7 +793,6 @@ class DrawingController {
       }
     }
 
-    // Clear from selection and update handles if this element was selected
     if (this.selectedIds.delete(id)) {
       this.callbacks.onStateChange({ selected_ids: [...this.selectedIds] });
       this.updateSelectionVisual();
@@ -860,7 +817,6 @@ class DrawingController {
     const startArrowhead = this.callbacks.getState("start_arrowhead") || "none";
     const endArrowhead = this.callbacks.getState("end_arrowhead") || (tool === "arrow" ? "arrow" : "none");
 
-    // Snap start point to nearby endpoints/midpoints
     const snapResult = findSnapPoint(point, this.elements, SNAP_THRESHOLD);
     const startPoint = snapResult ? snapResult.point : point;
     this.snapTarget = snapResult ? snapResult.point : null;
@@ -882,7 +838,6 @@ class DrawingController {
       points: [startPoint, startPoint],
       start_arrowhead: startArrowhead,
       end_arrowhead: endArrowhead,
-      // Store start binding if snapped to a shape
       startBinding: snapResult?.elementId ? { elementId: snapResult.elementId, anchor: snapResult.anchor! } : undefined,
     } as LineElement;
 
@@ -988,7 +943,6 @@ class DrawingController {
       return;
     }
 
-    // Handle line endpoint manipulation (start/end/midpoint handles)
     if (
       (this.activeHandle === "start" ||
         this.activeHandle === "end" ||
@@ -1009,7 +963,6 @@ class DrawingController {
           this.snapTarget = snapResult ? snapResult.point : null;
           this.lastSnapResult = snapResult;
           line.points[0] = snapResult ? snapResult.point : rawPoint;
-          // Update binding
           line.startBinding = snapResult?.elementId
             ? { elementId: snapResult.elementId, anchor: snapResult.anchor! }
             : undefined;
@@ -1019,23 +972,19 @@ class DrawingController {
           this.snapTarget = snapResult ? snapResult.point : null;
           this.lastSnapResult = snapResult;
           line.points[1] = snapResult ? snapResult.point : rawPoint;
-          // Update binding
           line.endBinding = snapResult?.elementId
             ? { elementId: snapResult.elementId, anchor: snapResult.anchor! }
             : undefined;
         } else if (this.activeHandle === "midpoint") {
-          // Move midpoint (creates or updates curve control point)
-          // Calculate where the handle started from (using same logic as getHandlePositions)
+          // Calculate where the handle started from (same logic as getHandlePositions)
           const centerX = (origLine.points[0].x + origLine.points[1].x) / 2;
           const centerY = (origLine.points[0].y + origLine.points[1].y) / 2;
 
           let handleStartX: number, handleStartY: number;
           if (origLine.midpoint) {
-            // Curved line - handle started at the existing control point
             handleStartX = origLine.midpoint.x;
             handleStartY = origLine.midpoint.y;
           } else {
-            // Straight line - handle started at perpendicular offset
             const lineDx = origLine.points[1].x - origLine.points[0].x;
             const lineDy = origLine.points[1].y - origLine.points[0].y;
             const length = Math.sqrt(lineDx * lineDx + lineDy * lineDy);
@@ -1051,7 +1000,6 @@ class DrawingController {
             }
           }
 
-          // New midpoint is handle start position plus drag delta
           line.midpoint = {
             x: handleStartX + dx,
             y: handleStartY + dy,
@@ -1109,7 +1057,6 @@ class DrawingController {
       return;
     }
 
-    // Update cursor based on hover state when using select tool
     const tool = this.callbacks.getState("tool");
     if (tool === "select" && this.svg) {
       const target = document.elementFromPoint(e.clientX, e.clientY) as SVGElement | null;
@@ -1128,31 +1075,10 @@ class DrawingController {
   private handlePointerUp(e: PointerEvent): void {
     this.svg?.releasePointerCapture(e.pointerId);
 
-    // Handle erasing
-    if (this.isErasing) {
-      this.isErasing = false;
-      return;
-    }
-
-    // Handle rotation
-    if (this.activeHandle === "rotation") {
-      this.commitRotation();
-      return;
-    }
-
-    // Handle resizing
-    if (this.activeHandle) {
-      this.commitResize();
-      return;
-    }
-
-    // Handle dragging
-    if (this.isDragging) {
-      this.commitDragging();
-      return;
-    }
-
-    // Handle drawing
+    if (this.isErasing) { this.isErasing = false; return; }
+    if (this.activeHandle === "rotation") { this.commitRotation(); return; }
+    if (this.activeHandle) { this.commitResize(); return; }
+    if (this.isDragging) { this.commitDragging(); return; }
     if (!this.isDrawing) return;
     this.commitDrawing();
   }
@@ -1160,31 +1086,10 @@ class DrawingController {
   private handlePointerCancel(e: PointerEvent): void {
     this.svg?.releasePointerCapture(e.pointerId);
 
-    // Handle erasing
-    if (this.isErasing) {
-      this.isErasing = false;
-      return;
-    }
-
-    // Handle rotation
-    if (this.activeHandle === "rotation") {
-      this.cancelRotation();
-      return;
-    }
-
-    // Handle resizing
-    if (this.activeHandle) {
-      this.cancelResize();
-      return;
-    }
-
-    // Handle dragging
-    if (this.isDragging) {
-      this.cancelDragging();
-      return;
-    }
-
-    // Handle drawing
+    if (this.isErasing) { this.isErasing = false; return; }
+    if (this.activeHandle === "rotation") { this.cancelRotation(); return; }
+    if (this.activeHandle) { this.cancelResize(); return; }
+    if (this.isDragging) { this.cancelDragging(); return; }
     if (!this.isDrawing) return;
     this.cancelDrawing();
   }
@@ -1228,7 +1133,6 @@ class DrawingController {
       this.previewGroup.appendChild(preview);
     }
 
-    // Render snap indicator
     if (this.snapTarget) {
       this.previewGroup.appendChild(createSnapIndicator(this.snapTarget));
     }
@@ -1250,7 +1154,6 @@ class DrawingController {
     });
   }
 
-  // Element rendering
   private renderElement(el: DrawingElement): SVGElement | null {
     const result = renderElementPure(el);
     return result?.element ?? null;
@@ -1279,7 +1182,6 @@ class DrawingController {
       resizedIds.add(this.resizeElementId);
     }
 
-    // Push to undo stack
     if (this.groupResizeStart) {
       const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
       for (const item of this.groupResizeStart.elements) {
@@ -1315,7 +1217,6 @@ class DrawingController {
 
     if (resizedIds.size > 0) this.updateBoundArrows(resizedIds);
 
-    // Reset resize state
     this.activeHandle = null;
     this.resizeStartBounds = null;
     this.resizeStartPoint = null;
@@ -1326,9 +1227,7 @@ class DrawingController {
     this.snapTarget = null;
   }
 
-  // Cancel resize operation - restore original bounds
   private cancelResize(): void {
-    // Handle group resize cancel
     if (this.groupResizeStart) {
       for (const item of this.groupResizeStart.elements) {
         this.elements.set(item.id, item.originalElement);
@@ -1337,13 +1236,11 @@ class DrawingController {
       this.doRenderHandles();
       this.groupResizeStart = null;
     } else if (this.resizeElementId && this.resizeOriginalElement) {
-      // Handle single element resize cancel
       this.elements.set(this.resizeElementId, this.resizeOriginalElement);
       this.rerenderElements();
       this.doRenderHandles();
     }
 
-    // Reset resize state
     this.activeHandle = null;
     this.resizeStartBounds = null;
     this.resizeStartPoint = null;
@@ -1354,7 +1251,7 @@ class DrawingController {
   }
 
   private commitRotation(): void {
-    // Collect IDs for bound-arrow update BEFORE nulling state
+    // Collect IDs BEFORE nulling state
     const rotatedIds = new Set<string>();
     if (this.groupRotationStart) {
       for (const item of this.groupRotationStart.elements) rotatedIds.add(item.id);
@@ -1398,7 +1295,6 @@ class DrawingController {
 
     if (rotatedIds.size > 0) this.updateBoundArrows(rotatedIds);
 
-    // Reset rotation state
     this.activeHandle = null;
     this.rotationStartAngle = 0;
     this.elementStartRotation = 0;
@@ -1407,9 +1303,7 @@ class DrawingController {
     this.groupRotationStart = null;
   }
 
-  // Cancel rotation operation - restore original element
   private cancelRotation(): void {
-    // Handle group rotation cancel
     if (this.groupRotationStart) {
       for (const item of this.groupRotationStart.elements) {
         this.elements.set(item.id, item.originalElement);
@@ -1418,7 +1312,6 @@ class DrawingController {
       this.doRenderHandles();
       this.groupRotationStart = null;
     } else if (this.rotationElementId && this.rotationOriginalElement) {
-      // Handle single element rotation cancel
       this.elements.set(this.rotationElementId, this.rotationOriginalElement);
       this.rerenderElements();
       this.doRenderHandles();
@@ -1460,7 +1353,6 @@ class DrawingController {
       }
 
       if (changed) {
-        // Re-render this element
         const svgEl = this.elementsGroup?.querySelector(`#${id}`);
         if (svgEl) {
           const newEl = this.renderElement(line);
@@ -1471,12 +1363,10 @@ class DrawingController {
   }
 
   destroy(): void {
-    // Clean up text overlay
     if (this.textEdit) {
       this.textEdit.overlay.remove();
       this.textEdit = null;
     }
-    // Clean up ResizeObserver
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
       this.resizeObserver = null;
@@ -1506,14 +1396,8 @@ class DrawingController {
     this.selectedIds.clear();
   }
 
-  // Public methods
-
-  // Set a text property (font_family, font_size, text_align) and apply to selected text elements
   setTextProperty(property: "font_family" | "font_size" | "text_align", value: string): void {
-    // Update signal
     this.callbacks.onStateChange({ [property]: value });
-
-    // Apply to all selected text elements
     const changed: TextElement[] = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
@@ -1560,28 +1444,19 @@ class DrawingController {
     // Coerce numeric properties so signals store numbers (not strings from input events)
     const numericProps = new Set(["stroke_width", "opacity", "dash_length", "dash_gap"]);
     const signalValue = numericProps.has(property) && typeof value === "string" ? Number(value) : value;
-    // Update signal
     this.callbacks.onStateChange({ [property]: signalValue });
-
-    // Apply to selected elements (respecting property-type applicability)
     const changed: DrawingElement[] = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el) continue;
 
-      // fill_color only applies to shapes
       if (property === "fill_color" && !["rect", "ellipse", "diamond"].includes(el.type)) continue;
-      // stroke_width doesn't apply to text
       if (property === "stroke_width" && el.type === "text") continue;
-
-      // Arrowhead properties only apply to line/arrow elements
       if ((property === "start_arrowhead" || property === "end_arrowhead") &&
           el.type !== "line" && el.type !== "arrow") continue;
-      // dash_length and dash_gap apply to all elements except text
       if (property === "dash_length" && el.type === "text") continue;
       if (property === "dash_gap" && el.type === "text") continue;
 
-      // Apply the value
       if (property === "stroke_color") {
         el.stroke_color = value as string;
       } else if (property === "fill_color" && isShape(el)) {
@@ -1624,22 +1499,14 @@ class DrawingController {
     this.setStyleProperty("dash_gap", values.dash_gap);
   }
 
-  // Switch to a new tool, saving current tool's settings and loading new tool's settings
   switchTool(newTool: Tool): void {
     if (newTool === this.currentTool) return;
-
-    // Save current tool's settings
     this.saveCurrentToolSettings();
-
-    // Load new tool's settings
     const settings = this.toolSettings.get(newTool) ?? TOOL_DEFAULTS[newTool];
     this.loadToolSettings(settings);
 
-    // Update tool signal and internal state
     this.currentTool = newTool;
     this.callbacks.onStateChange({ tool: newTool });
-
-    // Update cursor
     this.updateCursor();
   }
 
@@ -1774,7 +1641,6 @@ class DrawingController {
   }
 
   importSvg(svg: string): void {
-    // Parse SVG string
     const parser = new DOMParser();
     const doc = parser.parseFromString(svg, "image/svg+xml");
 
@@ -1902,7 +1768,6 @@ class DrawingController {
     });
   }
 
-  // Action methods
   startDrawing(point: Point): void {
     const tool = this.callbacks.getState("tool");
     const strokeColor = this.callbacks.getState("stroke_color");
@@ -1947,7 +1812,6 @@ class DrawingController {
       return;
     }
 
-    // Handle shape tools - update bounds from anchor
     if (this.anchorPoint && isShape(this.currentElement)) {
       this.currentElement.x = Math.min(this.anchorPoint.x, point.x);
       this.currentElement.y = Math.min(this.anchorPoint.y, point.y);
@@ -1957,7 +1821,6 @@ class DrawingController {
       return;
     }
 
-    // Handle pen/highlighter - add points with min distance threshold
     const last = this.currentPoints[this.currentPoints.length - 1];
     const dist = Math.sqrt((point.x - last.x) ** 2 + (point.y - last.y) ** 2);
     if (dist < 0.5) return;
@@ -1972,7 +1835,6 @@ class DrawingController {
   commitDrawing(): void {
     if (!this.currentElement || !this.elementsGroup) return;
 
-    // Store end binding for line/arrow elements if snapped to a shape
     if (isLine(this.currentElement) && this.lastSnapResult?.elementId) {
       this.currentElement.endBinding = {
         elementId: this.lastSnapResult.elementId,
@@ -1980,14 +1842,10 @@ class DrawingController {
       };
     }
 
-    // Add to elements
     this.elements.set(this.currentElement.id, this.currentElement);
-
-    // Render to DOM
     const svgEl = this.renderElement(this.currentElement);
     if (svgEl) this.elementsGroup.appendChild(svgEl);
 
-    // Push to undo stack
     this.undoStack.push({ action: "add", data: this.currentElement });
     this.redoStack = [];
     this.callbacks.onStateChange({
@@ -1996,7 +1854,6 @@ class DrawingController {
       is_drawing: false,
     });
 
-    // Cleanup
     this.clearPreview();
     this.currentElement = null;
     this.currentPoints = [];
@@ -2037,7 +1894,6 @@ class DrawingController {
       selected_is_text: hasText,
     };
 
-    // Sync selected element's properties to toolbar signals
     if (this.selectedIds.size === 1) {
       const el = this.elements.get(Array.from(this.selectedIds)[0]);
       if (el) Object.assign(patch, buildSelectionPatch(el));
@@ -2061,18 +1917,9 @@ class DrawingController {
     const action = this.undoStack.pop();
     if (!action) return;
 
-    // Process the undo action using pure function
     const result = processUndo(action as UndoAction, this.elements);
-
-    // Apply mutations
-    for (const id of result.elementsToDelete) {
-      this.elements.delete(id);
-    }
-    for (const [id, el] of result.elementsToSet) {
-      this.elements.set(id, el);
-    }
-
-    // Push to redo stack
+    for (const id of result.elementsToDelete) this.elements.delete(id);
+    for (const [id, el] of result.elementsToSet) this.elements.set(id, el);
     this.redoStack.push(action);
 
     this.rerenderElements();
@@ -2087,18 +1934,9 @@ class DrawingController {
     const action = this.redoStack.pop();
     if (!action) return;
 
-    // Process the redo action using pure function
     const result = processRedo(action as UndoAction, this.elements);
-
-    // Apply mutations
-    for (const id of result.elementsToDelete) {
-      this.elements.delete(id);
-    }
-    for (const [id, el] of result.elementsToSet) {
-      this.elements.set(id, el);
-    }
-
-    // Push to undo stack
+    for (const id of result.elementsToDelete) this.elements.delete(id);
+    for (const [id, el] of result.elementsToSet) this.elements.set(id, el);
     this.undoStack.push(action);
 
     this.rerenderElements();
@@ -2117,7 +1955,6 @@ class DrawingController {
       if (svgEl) this.elementsGroup.appendChild(svgEl);
     }
 
-    // Filter selection to only elements that still exist
     for (const id of this.selectedIds) {
       if (!this.elements.has(id)) {
         this.selectedIds.delete(id);
@@ -2156,7 +1993,6 @@ class DrawingController {
       }
     }
 
-    // Clear bindings referencing deleted element IDs
     for (const [, el] of this.elements) {
       if (isLine(el)) {
         if (el.startBinding && this.selectedIds.has(el.startBinding.elementId)) {
@@ -2171,7 +2007,6 @@ class DrawingController {
     this.selectedIds.clear();
     this.rerenderElements();
 
-    // Push as batch action
     for (const el of deletedElements) {
       this.undoStack.push({ action: "remove", data: el });
     }
@@ -2198,7 +2033,6 @@ class DrawingController {
     this.redoStack = [];
     this.rerenderElements();
 
-    // Select the duplicates
     this.selectedIds.clear();
     for (const id of newIds) this.selectedIds.add(id);
 

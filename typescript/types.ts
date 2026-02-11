@@ -58,7 +58,7 @@ export interface LineElement extends BaseElement {
   points: [Point, Point];
   start_arrowhead: ArrowheadStyle;
   end_arrowhead: ArrowheadStyle;
-  midpoint?: Point; // Optional bezier control point for curved lines
+  midpoint?: Point | undefined; // Optional bezier control point for curved lines
   startBinding?: Binding | undefined;
   endBinding?: Binding | undefined;
 }
@@ -149,7 +149,7 @@ export interface DrawingConfig {
 export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
 // Position types for move operations
-export type MovePosition = { x: number; y: number } | { points: Point[]; midpoint?: Point };
+export type MovePosition = { x: number; y: number } | { points: Point[]; midpoint?: Point | undefined };
 
 // State contract between TypeScript controller and host framework (e.g. Datastar signals)
 export interface DrawingState {
