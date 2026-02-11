@@ -1,4 +1,4 @@
-import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, cursorForHandle, fontFamilyMap, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
+import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontFamilyMap, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
 import {
   cloneElement,
   findSnapPoint,
@@ -6,12 +6,16 @@ import {
   getBoundingBox,
   getElementCenter,
   getGroupBoundingBox,
-  getRotatedCursor,
-  getRotatedCorners,
   resolveBindingPoint,
-  rotatePoint,
 } from "./geometry.js";
 import type { SnapResult } from "./geometry.js";
+import {
+  createSnapIndicator,
+  ensureHandlesGroup,
+  getHandlePositions,
+  hitTestHandle,
+  renderHandles,
+} from "./handles.js";
 import { processRedo, processUndo } from "./history.js";
 import {
   applyGroupResize,
@@ -29,7 +33,6 @@ import type {
   DrawingState,
   GroupResizeState,
   GroupRotationState,
-  Handle,
   HandleType,
   Layer,
   LineElement,
@@ -310,7 +313,7 @@ class DrawingController {
 
     // Check for handle click when using select tool with a selection
     if (tool === "select" && this.selectedIds.size > 0) {
-      const handle = this.hitTestHandle(e.clientX, e.clientY);
+      const handle = hitTestHandle(e.clientX, e.clientY, this.selectedIds, this.elements);
       if (handle) {
         e.preventDefault();
         this.svg?.setPointerCapture(e.pointerId);
@@ -1015,7 +1018,7 @@ class DrawingController {
         const groupRotIds = new Set(this.groupRotationStart.elements.map(item => item.id));
         this.updateBoundArrows(groupRotIds);
         this.rerenderElements();
-        this.renderHandles();
+        this.doRenderHandles();
       } else if (this.rotationElementId) {
         // Single element rotation
         const element = this.elements.get(this.rotationElementId);
@@ -1032,7 +1035,7 @@ class DrawingController {
           element.rotation = newRotation;
           this.updateBoundArrows(new Set([this.rotationElementId]));
           this.rerenderElements();
-          this.renderHandles();
+          this.doRenderHandles();
         }
       }
       return;
@@ -1108,7 +1111,7 @@ class DrawingController {
           };
         }
         this.rerenderElements();
-        this.renderHandles();
+        this.doRenderHandles();
       }
       return;
     }
@@ -1155,7 +1158,7 @@ class DrawingController {
       this.rerenderElements();
       // Skip handle re-render during text resize to avoid jitter from approximate bounding box.
       // Handles update on pointer release. Shapes have exact bounds so they can update continuously.
-      if (!isTextElement) this.renderHandles();
+      if (!isTextElement) this.doRenderHandles();
       return;
     }
 
@@ -1280,21 +1283,10 @@ class DrawingController {
 
     // Render snap indicator
     if (this.snapTarget) {
-      this.previewGroup.appendChild(this.createSnapIndicator(this.snapTarget));
+      this.previewGroup.appendChild(createSnapIndicator(this.snapTarget));
     }
   }
 
-  private createSnapIndicator(point: Point): SVGCircleElement {
-    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    circle.setAttribute("cx", String(point.x));
-    circle.setAttribute("cy", String(point.y));
-    circle.setAttribute("r", "0.6");
-    circle.setAttribute("fill", "white");
-    circle.setAttribute("stroke", "#10b981");
-    circle.setAttribute("stroke-width", "0.15");
-    circle.style.pointerEvents = "none";
-    return circle;
-  }
 
   private clearPreview(): void {
     if (this.previewGroup) {
@@ -1317,123 +1309,19 @@ class DrawingController {
     return result?.element ?? null;
   }
 
-
-  // Get handle positions for selection manipulation
-  getHandlePositions(el: DrawingElement): Handle[] {
-    const handles: Handle[] = [];
-
-    if (isLine(el)) {
-      const line = el;
-      // Lines get start/end handles + midpoint (no rotation handle - use endpoints instead)
-      handles.push({
-        type: "start",
-        x: line.points[0].x,
-        y: line.points[0].y,
-        cursor: cursorForHandle.start,
-      });
-      handles.push({
-        type: "end",
-        x: line.points[1].x,
-        y: line.points[1].y,
-        cursor: cursorForHandle.end,
-      });
-
-      // For midpoint handle: if line has a curve control point, use it
-      // Otherwise, offset perpendicular to the line for easier grabbing
-      let midX: number, midY: number;
-      if (line.midpoint) {
-        // Curved line - show handle at the actual control point
-        midX = line.midpoint.x;
-        midY = line.midpoint.y;
-      } else {
-        // Straight line - offset perpendicular to indicate "you can bend this"
-        const centerX = (line.points[0].x + line.points[1].x) / 2;
-        const centerY = (line.points[0].y + line.points[1].y) / 2;
-
-        // Calculate perpendicular direction
-        const dx = line.points[1].x - line.points[0].x;
-        const dy = line.points[1].y - line.points[0].y;
-        const length = Math.sqrt(dx * dx + dy * dy);
-
-        if (length > 0.1) {
-          // Perpendicular unit vector (rotated 90 degrees)
-          const perpX = -dy / length;
-          const perpY = dx / length;
-          // Offset by fixed amount (2 units in viewBox coordinates)
-          const offset = 2;
-          midX = centerX + perpX * offset;
-          midY = centerY + perpY * offset;
-        } else {
-          // Very short line - just use center
-          midX = centerX;
-          midY = centerY;
-        }
-      }
-
-      handles.push({
-        type: "midpoint",
-        x: midX,
-        y: midY,
-        cursor: cursorForHandle.midpoint,
-      });
-    } else {
-      // Shapes, text, and paths get resize handles + rotation handle
-      const bbox = getBoundingBox(el);
-      const cx = bbox.x + bbox.width / 2;
-      const cy = bbox.y + bbox.height / 2;
-      const center = { x: cx, y: cy };
-
-      // Helper to create handle, optionally rotated, with rotation-aware cursor
-      const addHandle = (type: HandleType, x: number, y: number, cursor: string) => {
-        const rotatedCursor = getRotatedCursor(type, el.rotation) ?? cursor;
-        if (el.rotation !== 0) {
-          const rotated = rotatePoint({ x, y }, center, el.rotation);
-          handles.push({ type, x: rotated.x, y: rotated.y, cursor: rotatedCursor });
-        } else {
-          handles.push({ type, x, y, cursor: rotatedCursor });
-        }
-      };
-
-      // Corner handles (always shown)
-      addHandle("nw", bbox.x, bbox.y, cursorForHandle.nw);
-      addHandle("ne", bbox.x + bbox.width, bbox.y, cursorForHandle.ne);
-      addHandle("se", bbox.x + bbox.width, bbox.y + bbox.height, cursorForHandle.se);
-      addHandle("sw", bbox.x, bbox.y + bbox.height, cursorForHandle.sw);
-
-      // Edge handles (not for text - text scales proportionally from corners only)
-      if (el.type !== "text") {
-        addHandle("n", cx, bbox.y, cursorForHandle.n);
-        addHandle("e", bbox.x + bbox.width, cy, cursorForHandle.e);
-        addHandle("s", cx, bbox.y + bbox.height, cursorForHandle.s);
-        addHandle("w", bbox.x, cy, cursorForHandle.w);
-      }
-
-      // Rotation handle (above the top center)
-      addHandle("rotation", cx, bbox.y - 3.5, cursorForHandle.rotation);
+  private doRenderHandles(): void {
+    this.handlesGroup = ensureHandlesGroup(this.handlesGroup, this.svg);
+    const selectedIds = this.callbacks.getState("selected_ids");
+    const selectedElements: DrawingElement[] = [];
+    for (const id of selectedIds) {
+      const el = this.elements.get(id);
+      if (el) selectedElements.push(el);
     }
-
-    return handles;
+    renderHandles(this.handlesGroup, selectedElements, {
+      snapTarget: this.snapTarget,
+      activeHandle: this.activeHandle,
+    });
   }
-
-  // Hit test for handles - check if a point hits any visible handle
-  private hitTestHandle(clientX: number, clientY: number): Handle | null {
-    const target = document.elementFromPoint(clientX, clientY) as SVGElement | null;
-    if (!target) return null;
-
-    const handleType = target.getAttribute("data-handle") as HandleType | null;
-    if (!handleType) return null;
-
-    // Get the selected element to compute handle positions
-    if (this.selectedIds.size !== 1) return null; // Only single-select resize for now
-
-    const selectedId = Array.from(this.selectedIds)[0];
-    const element = this.elements.get(selectedId);
-    if (!element) return null;
-
-    const handles = this.getHandlePositions(element);
-    return handles.find((h) => h.type === handleType) || null;
-  }
-
 
   private commitResize(): void {
     // Collect IDs for bound-arrow update BEFORE nulling state
@@ -1499,13 +1387,13 @@ class DrawingController {
         this.elements.set(item.id, item.originalElement);
       }
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
       this.groupResizeStart = null;
     } else if (this.resizeElementId && this.resizeOriginalElement) {
       // Handle single element resize cancel
       this.elements.set(this.resizeElementId, this.resizeOriginalElement);
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
     }
 
     // Reset resize state
@@ -1580,13 +1468,13 @@ class DrawingController {
         this.elements.set(item.id, item.originalElement);
       }
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
       this.groupRotationStart = null;
     } else if (this.rotationElementId && this.rotationOriginalElement) {
       // Handle single element rotation cancel
       this.elements.set(this.rotationElementId, this.rotationOriginalElement);
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
     }
 
     // Reset rotation state
@@ -1597,176 +1485,6 @@ class DrawingController {
     this.rotationOriginalElement = null;
   }
 
-  // Ensure handles group exists (created on demand, above elements)
-  private ensureHandlesGroup(): SVGGElement {
-    if (!this.handlesGroup) {
-      this.handlesGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      this.handlesGroup.setAttribute("class", "selection-handles");
-      this.svg?.appendChild(this.handlesGroup);
-    }
-    return this.handlesGroup;
-  }
-
-  // Render selection handles for selected elements
-  private renderHandles(): void {
-    const group = this.ensureHandlesGroup();
-    group.innerHTML = ""; // Clear existing handles
-
-    const selectedIds = this.callbacks.getState("selected_ids");
-    if (selectedIds.length === 0) return;
-
-    // Get all selected elements
-    const selectedElements: DrawingElement[] = [];
-    for (const id of selectedIds) {
-      const el = this.elements.get(id);
-      if (el) selectedElements.push(el);
-    }
-    if (selectedElements.length === 0) return;
-
-    // For single selection, use element handles
-    // For multi-selection, compute combined bounding box
-    let handles: Handle[];
-    if (selectedElements.length === 1) {
-      handles = this.getHandlePositions(selectedElements[0]);
-    } else {
-      // Compute combined bounding box for multi-selection (accounts for rotation)
-      const groupBbox = getGroupBoundingBox(selectedElements);
-      const { x: minX, y: minY, width, height } = groupBbox;
-      const maxX = minX + width;
-      const maxY = minY + height;
-      const cx = minX + width / 2;
-      const cy = minY + height / 2;
-
-      // Create handles for combined bounding box
-      handles = [
-        { type: "nw", x: minX, y: minY, cursor: cursorForHandle.nw },
-        { type: "n", x: cx, y: minY, cursor: cursorForHandle.n },
-        { type: "ne", x: maxX, y: minY, cursor: cursorForHandle.ne },
-        { type: "e", x: maxX, y: cy, cursor: cursorForHandle.e },
-        { type: "se", x: maxX, y: maxY, cursor: cursorForHandle.se },
-        { type: "s", x: cx, y: maxY, cursor: cursorForHandle.s },
-        { type: "sw", x: minX, y: maxY, cursor: cursorForHandle.sw },
-        { type: "w", x: minX, y: cy, cursor: cursorForHandle.w },
-        { type: "rotation", x: cx, y: minY - 3.5, cursor: cursorForHandle.rotation },
-      ];
-    }
-
-    // Render each handle
-    for (const handle of handles) {
-      if (handle.type === "rotation") {
-        // Draw connector from rotation handle to element's (rotated) top center
-        let topCenterX = handle.x;
-        let topCenterY = handle.y + 3.5;
-        if (selectedElements.length === 1) {
-          const el = selectedElements[0];
-          const bbox = getBoundingBox(el);
-          const elCx = bbox.x + bbox.width / 2;
-          const elCy = bbox.y + bbox.height / 2;
-          const rotatedTopCenter = rotatePoint(
-            { x: elCx, y: bbox.y },
-            { x: elCx, y: elCy },
-            el.rotation,
-          );
-          topCenterX = rotatedTopCenter.x;
-          topCenterY = rotatedTopCenter.y;
-        }
-        const connector = document.createElementNS("http://www.w3.org/2000/svg", "line");
-        connector.setAttribute("x1", String(handle.x));
-        connector.setAttribute("y1", String(handle.y));
-        connector.setAttribute("x2", String(topCenterX));
-        connector.setAttribute("y2", String(topCenterY));
-        connector.setAttribute("stroke", "#10b981");
-        connector.setAttribute("stroke-width", "0.08");
-        connector.setAttribute("stroke-dasharray", "0.3 0.2");
-        connector.setAttribute("opacity", "0.6");
-        group.appendChild(connector);
-
-        // Rotation handle: larger circle with distinct color (green)
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("cx", String(handle.x));
-        circle.setAttribute("cy", String(handle.y));
-        circle.setAttribute("r", "0.55");
-        circle.setAttribute("fill", "white");
-        circle.setAttribute("stroke", "#10b981");
-        circle.setAttribute("stroke-width", "0.15");
-        circle.setAttribute("data-handle", handle.type);
-        circle.style.cursor = handle.cursor;
-        group.appendChild(circle);
-      } else if (handle.type === "midpoint") {
-        // For curved lines, draw control arms from each endpoint to the control point
-        if (selectedElements.length === 1) {
-          const el = selectedElements[0];
-          if (isLine(el)) {
-            for (const pt of el.points) {
-              const arm = document.createElementNS("http://www.w3.org/2000/svg", "line");
-              arm.setAttribute("x1", String(pt.x));
-              arm.setAttribute("y1", String(pt.y));
-              arm.setAttribute("x2", String(handle.x));
-              arm.setAttribute("y2", String(handle.y));
-              arm.setAttribute("stroke", "#10b981");
-              arm.setAttribute("stroke-width", "0.08");
-              arm.setAttribute("stroke-dasharray", "0.3 0.2");
-              arm.setAttribute("opacity", "0.6");
-              group.appendChild(arm);
-            }
-          }
-        }
-
-        // Midpoint handle: hollow green circle (distinct from resize handles)
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("cx", String(handle.x));
-        circle.setAttribute("cy", String(handle.y));
-        circle.setAttribute("r", "0.5");
-        circle.setAttribute("fill", "white");
-        circle.setAttribute("stroke", "#10b981");
-        circle.setAttribute("stroke-width", "0.15");
-        circle.setAttribute("data-handle", handle.type);
-        circle.style.cursor = handle.cursor;
-        group.appendChild(circle);
-      } else if (handle.type === "start" || handle.type === "end") {
-        // Line endpoint handles: filled circles (distinct from resize squares)
-        // Green stroke if bound to a shape, blue otherwise
-        let handleStroke = "#0066ff";
-        if (selectedElements.length === 1) {
-          const el = selectedElements[0];
-          if (isLine(el)) {
-            if ((handle.type === "start" && el.startBinding) ||
-                (handle.type === "end" && el.endBinding)) {
-              handleStroke = "#10b981";
-            }
-          }
-        }
-        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-        circle.setAttribute("cx", String(handle.x));
-        circle.setAttribute("cy", String(handle.y));
-        circle.setAttribute("r", "0.45");
-        circle.setAttribute("fill", "white");
-        circle.setAttribute("stroke", handleStroke);
-        circle.setAttribute("stroke-width", "0.12");
-        circle.setAttribute("data-handle", handle.type);
-        circle.style.cursor = handle.cursor;
-        group.appendChild(circle);
-      } else {
-        // Resize handle: square (white fill, blue stroke)
-        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-        rect.setAttribute("x", String(handle.x - 0.4));
-        rect.setAttribute("y", String(handle.y - 0.4));
-        rect.setAttribute("width", "0.8");
-        rect.setAttribute("height", "0.8");
-        rect.setAttribute("fill", "white");
-        rect.setAttribute("stroke", "#0066ff");
-        rect.setAttribute("stroke-width", "0.1");
-        rect.setAttribute("data-handle", handle.type);
-        rect.style.cursor = handle.cursor;
-        group.appendChild(rect);
-      }
-    }
-
-    // Render snap indicator during endpoint handle dragging
-    if (this.snapTarget && (this.activeHandle === "start" || this.activeHandle === "end")) {
-      group.appendChild(this.createSnapIndicator(this.snapTarget));
-    }
-  }
 
   /**
    * Update positions of arrows/lines that are bound to any of the given element IDs.
@@ -1880,7 +1598,7 @@ class DrawingController {
     }
     if (changed.length > 0) {
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
 
       // If textarea overlay is open for one of the changed elements, update it
       if (this.textOverlay && this.editingTextId) {
@@ -1941,7 +1659,7 @@ class DrawingController {
 
     if (changed.length > 0) {
       this.rerenderElements();
-      this.renderHandles();
+      this.doRenderHandles();
 
       // Update textarea overlay if editing text and color changed
       if (this.textOverlay && this.editingTextId && property === "stroke_color") {
@@ -2424,7 +2142,7 @@ class DrawingController {
       for (const el of outlines) el.remove();
     }
     // Render selection handles (no separate dashed outline to avoid sync issues)
-    this.renderHandles();
+    this.doRenderHandles();
   }
 
   undo(): void {
@@ -2446,7 +2164,7 @@ class DrawingController {
     this.redoStack.push(action);
 
     this.rerenderElements();
-    this.renderHandles();
+    this.doRenderHandles();
     this.callbacks.onStateChange({
       can_undo: this.undoStack.length > 0,
       can_redo: this.redoStack.length > 0,
@@ -2472,7 +2190,7 @@ class DrawingController {
     this.undoStack.push(action);
 
     this.rerenderElements();
-    this.renderHandles();
+    this.doRenderHandles();
     this.callbacks.onStateChange({
       can_undo: this.undoStack.length > 0,
       can_redo: this.redoStack.length > 0,
