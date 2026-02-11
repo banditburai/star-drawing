@@ -1,4 +1,4 @@
-import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontFamilyMap, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
+import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
 import {
   cloneElement,
   findSnapPoint,
@@ -17,6 +17,14 @@ import {
   renderHandles,
 } from "./handles.js";
 import { processRedo, processUndo } from "./history.js";
+import {
+  autoResizeTextarea,
+  closeTextOverlay as closeTextOverlayDOM,
+  createTextOverlay,
+  resolveFontSize,
+  updateTextOverlayStyle,
+} from "./text-editing.js";
+import type { TextEditState } from "./text-editing.js";
 import {
   applyGroupResize,
   applyGroupRotation,
@@ -83,11 +91,7 @@ class DrawingController {
   private isErasing = false;
 
   // Text editing state
-  private textOverlay: HTMLTextAreaElement | null = null;
-  private editingTextId: string | null = null;
-  private textEditSvgPoint: Point | null = null;
-  private textCommitFn: (() => void) | null = null;
-  private textBlurTimeout: ReturnType<typeof setTimeout> | null = null;
+  private textEdit: TextEditState | null = null;
   private lastClickTime = 0;
   private lastClickId: string | null = null;
 
@@ -294,9 +298,8 @@ class DrawingController {
   }
 
   private handlePointerDown(e: PointerEvent): void {
-    // If text overlay is active, commit and close it first
-    if (this.textOverlay && this.textCommitFn) {
-      this.textCommitFn();
+    if (this.textEdit && this.textEdit.commitFn) {
+      this.textEdit.commitFn();
       return;
     }
 
@@ -466,81 +469,57 @@ class DrawingController {
   }
 
   private startTextEditing(svgPoint: Point, existingElement?: TextElement): void {
-    if (this.textOverlay) return;
+    if (this.textEdit) return;
 
-    const container = this.container;
     const rect = this.svgRect;
     if (!rect) return;
 
     const isEditing = !!existingElement;
     const fm = isEditing ? existingElement.font_family : this.callbacks.getState("font_family");
     const rawFs = isEditing ? existingElement.font_size : this.callbacks.getState("font_size");
-    // Resolve string presets ("small"/"medium"/"large") to numeric viewBox values
-    const fs: number = typeof rawFs === "string" ? (fontSizeMap[rawFs] ?? 4) : (rawFs as number);
+    const fs = resolveFontSize(rawFs);
     const ta = isEditing ? existingElement.text_align : this.callbacks.getState("text_align");
-    const color = isEditing ? existingElement.stroke_color : (this.callbacks.getState("stroke_color"));
-
-    this.editingTextId = existingElement?.id ?? null;
-    this.textEditSvgPoint = svgPoint;
+    const color = isEditing ? existingElement.stroke_color : this.callbacks.getState("stroke_color");
 
     const pos = this.svgToContainerPx(svgPoint.x, svgPoint.y);
     const fontSizePx = this.svgUnitsToPx(fs, "y");
 
-    // The SVG uses preserveAspectRatio="none" so text is horizontally stretched.
-    // Apply the same stretch to the textarea so editing is WYSIWYG.
-    const stretchX = rect.width / rect.height;
-    const scaleXCss = `scaleX(${stretchX})`;
-    // Transform order: scale first (inner), then translate (outer) — CSS applies right-to-left
-    const transformCss = ta === "center" ? `${scaleXCss} translateX(-50%)`
-                       : ta === "right" ? `${scaleXCss} translateX(-100%)`
-                       : scaleXCss;
+    const textarea = createTextOverlay(
+      { left: pos.left, top: pos.top, fontSizePx, stretchX: rect.width / rect.height },
+      { fontFamily: fm, fontSize: rawFs, textAlign: ta, color },
+      existingElement?.text,
+    );
 
-    const textarea = document.createElement("textarea");
-    textarea.className = "drawing-text-input";
-    textarea.value = existingElement?.text ?? "";
-
-    Object.assign(textarea.style, {
-      left: `${pos.left}px`,
-      top: `${pos.top}px`,
-      fontSize: `${fontSizePx}px`,
-      fontFamily: fontFamilyMap[fm] || fontFamilyMap.normal,
-      textAlign: ta,
-      color,
-      minWidth: "20px",
-      minHeight: `${fontSizePx * 1.4}px`,
-      transformOrigin: "0 0",
-      transform: transformCss,
-    });
-
-    const autoResize = () => {
-      textarea.style.height = "auto";
-      textarea.style.height = `${textarea.scrollHeight}px`;
-      textarea.style.width = "auto";
-      textarea.style.width = `${Math.max(40, textarea.scrollWidth + 4)}px`;
+    const state: TextEditState = {
+      overlay: textarea,
+      editingId: existingElement?.id ?? null,
+      svgPoint,
+      commitFn: null,
+      blurTimeout: null,
+      committed: false,
     };
+    this.textEdit = state;
 
     const commit = () => {
-      if (this._textCommitted) return;
-      this._textCommitted = true;
+      if (state.committed) return;
+      state.committed = true;
       const text = textarea.value.trim();
       if (text) {
         this.commitTextEdit(text);
-      } else if (isEditing) {
-        // Empty text on existing element = restore original (don't delete)
       }
       this.closeTextOverlay();
     };
-    this.textCommitFn = commit;
+    state.commitFn = commit;
 
-    textarea.addEventListener("input", autoResize);
+    textarea.addEventListener("input", () => autoResizeTextarea(textarea));
     textarea.addEventListener("blur", () => {
-      this.textBlurTimeout = setTimeout(commit, 100);
+      state.blurTimeout = setTimeout(commit, 100);
     });
     textarea.addEventListener("keydown", (e: KeyboardEvent) => {
-      e.stopPropagation(); // Don't trigger tool shortcuts while typing
+      e.stopPropagation();
       if (e.key === "Escape") {
         e.preventDefault();
-        this._textCommitted = true; // Prevent blur handler from committing
+        state.committed = true;
         this.closeTextOverlay();
         if (!isEditing) this.switchTool("select");
       }
@@ -550,44 +529,35 @@ class DrawingController {
       }
     });
 
-    // Hide SVG text if editing an existing element
     if (isEditing && existingElement) {
       this.elementsGroup?.querySelector(`#${existingElement.id}`)?.setAttribute("display", "none");
     }
 
-    this._textCommitted = false;
-    container.appendChild(textarea);
-    this.textOverlay = textarea;
+    this.container.appendChild(textarea);
     this.callbacks.onStateChange({ text_editing: true });
 
     requestAnimationFrame(() => {
       textarea.focus();
       if (isEditing) textarea.select();
-      autoResize();
+      autoResizeTextarea(textarea);
     });
   }
 
-  private _textCommitted = false;
-
   private commitTextEdit(text: string): void {
-    const svgPoint = this.textEditSvgPoint;
-    if (!svgPoint) return;
+    if (!this.textEdit) return;
+    const svgPoint = this.textEdit.svgPoint;
 
-    if (this.editingTextId) {
-      // Update existing text element — only change text content.
-      // Style properties (font_family, font_size, text_align, stroke_color)
-      // are already current on the element via setTextProperty/setStyleProperty.
-      const el = this.elements.get(this.editingTextId) as TextElement | undefined;
+    if (this.textEdit.editingId) {
+      const el = this.elements.get(this.textEdit.editingId) as TextElement | undefined;
       if (el) {
         el.text = text;
         this.rerenderElements();
       }
     } else {
-      // Create new text element — read current signal values (not stale closures)
-      const fm = this.callbacks.getState("font_family") as TextElement["font_family"];
+      const fm = this.callbacks.getState("font_family");
       const rawFs = this.callbacks.getState("font_size");
-      const fs: number = typeof rawFs === "string" ? (fontSizeMap[rawFs] ?? 4) : (rawFs as number);
-      const ta = this.callbacks.getState("text_align") as TextElement["text_align"];
+      const fs = resolveFontSize(rawFs);
+      const ta = this.callbacks.getState("text_align");
       const color = this.callbacks.getState("stroke_color");
       const opacity = this.callbacks.getState("opacity");
       const layer = this.callbacks.getState("active_layer");
@@ -632,60 +602,32 @@ class DrawingController {
   }
 
   private closeTextOverlay(): void {
-    // Clear stale blur timeout to prevent race conditions
-    if (this.textBlurTimeout) {
-      clearTimeout(this.textBlurTimeout);
-      this.textBlurTimeout = null;
+    if (!this.textEdit) return;
+    closeTextOverlayDOM(this.textEdit);
+    if (this.textEdit.editingId) {
+      this.elementsGroup?.querySelector(`#${this.textEdit.editingId}`)?.removeAttribute("display");
     }
-    if (this.textOverlay) {
-      this.textOverlay.remove();
-      this.textOverlay = null;
-    }
-    this.textCommitFn = null;
-    // Show SVG text again if we were editing
-    if (this.editingTextId) {
-      this.elementsGroup?.querySelector(`#${this.editingTextId}`)?.removeAttribute("display");
-      this.editingTextId = null;
-    }
-    this.textEditSvgPoint = null;
+    this.textEdit = null;
     this.callbacks.onStateChange({ text_editing: false });
   }
 
-  /** Update the visible textarea overlay to match current element state */
   private updateTextOverlay(el: TextElement): void {
-    if (!this.textOverlay) return;
+    if (!this.textEdit) return;
     const rect = this.svgRect;
     if (!rect) return;
 
-    const pos = this.svgToContainerPx(el.x, el.y);
-    const fontSizePx = this.svgUnitsToPx(el.font_size, "y");
-    const stretchX = rect.width / rect.height;
-    const scaleXCss = `scaleX(${stretchX})`;
-    const ta = el.text_align;
-    const transformCss = ta === "center" ? `${scaleXCss} translateX(-50%)`
-                       : ta === "right" ? `${scaleXCss} translateX(-100%)`
-                       : scaleXCss;
-
-    Object.assign(this.textOverlay.style, {
-      left: `${pos.left}px`,
-      top: `${pos.top}px`,
-      fontSize: `${fontSizePx}px`,
-      fontFamily: fontFamilyMap[el.font_family] || fontFamilyMap.normal,
-      textAlign: ta,
-      color: el.stroke_color,
-      minHeight: `${fontSizePx * 1.4}px`,
-      transform: transformCss,
-    });
-
-    // Update stored SVG point for commit
-    this.textEditSvgPoint = { x: el.x, y: el.y };
+    this.textEdit.svgPoint = updateTextOverlayStyle(
+      this.textEdit.overlay, el, rect,
+      (x, y) => this.svgToContainerPx(x, y),
+      (u, a) => this.svgUnitsToPx(u, a),
+    );
 
     // Cancel blur timeout and refocus (clicking toolbar button triggers blur)
-    if (this.textBlurTimeout) {
-      clearTimeout(this.textBlurTimeout);
-      this.textBlurTimeout = null;
+    if (this.textEdit.blurTimeout) {
+      clearTimeout(this.textEdit.blurTimeout);
+      this.textEdit.blurTimeout = null;
     }
-    this.textOverlay.focus();
+    this.textEdit.overlay.focus();
   }
 
   private selectAtPoint(clientX: number, clientY: number, additive: boolean): void {
@@ -1525,9 +1467,9 @@ class DrawingController {
 
   destroy(): void {
     // Clean up text overlay
-    if (this.textOverlay) {
-      this.textOverlay.remove();
-      this.textOverlay = null;
+    if (this.textEdit) {
+      this.textEdit.overlay.remove();
+      this.textEdit = null;
     }
     // Clean up ResizeObserver
     if (this.resizeObserver) {
@@ -1601,8 +1543,8 @@ class DrawingController {
       this.doRenderHandles();
 
       // If textarea overlay is open for one of the changed elements, update it
-      if (this.textOverlay && this.editingTextId) {
-        const editedEl = changed.find(t => t.id === this.editingTextId);
+      if (this.textEdit && this.textEdit.editingId) {
+        const editedEl = changed.find(t => t.id === this.textEdit!.editingId);
         if (editedEl) this.updateTextOverlay(editedEl);
       }
     }
@@ -1662,8 +1604,8 @@ class DrawingController {
       this.doRenderHandles();
 
       // Update textarea overlay if editing text and color changed
-      if (this.textOverlay && this.editingTextId && property === "stroke_color") {
-        const editedEl = changed.find(e => e.id === this.editingTextId);
+      if (this.textEdit && this.textEdit.editingId && property === "stroke_color") {
+        const editedEl = changed.find(e => e.id === this.textEdit!.editingId);
         if (editedEl && isText(editedEl)) this.updateTextOverlay(editedEl);
       }
     }
