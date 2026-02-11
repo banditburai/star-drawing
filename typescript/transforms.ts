@@ -211,6 +211,17 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
   return { x, y, width, height };
 }
 
+function positionTextInBounds(el: TextElement, bounds: BoundingBox): void {
+  el.y = bounds.y;
+  if (el.text_align === "center") {
+    el.x = bounds.x + bounds.width / 2;
+  } else if (el.text_align === "right") {
+    el.x = bounds.x + bounds.width;
+  } else {
+    el.x = bounds.x;
+  }
+}
+
 /**
  * Apply new bounds to an element, scaling text font size and remapping line/path points.
  * Used for both single-element resize (interactive) and group resize (per-element).
@@ -228,25 +239,26 @@ export function applyResize(
     element.y = newBounds.y;
     element.width = newBounds.width;
     element.height = newBounds.height;
-  } else if (isText(element)) {
-    const baseFontSize = originalFontSize ?? (originalElement as TextElement).font_size;
+  } else if (isText(element) && isText(originalElement)) {
+    const baseFontSize = originalFontSize ?? originalElement.font_size;
     const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
     const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
     const scale = Math.sqrt(scaleX * scaleY);
     element.font_size = Math.max(0.5, baseFontSize * scale);
-    element.y = newBounds.y;
-    if (element.text_align === "center") {
-      element.x = newBounds.x + newBounds.width / 2;
-    } else if (element.text_align === "right") {
-      element.x = newBounds.x + newBounds.width;
-    } else {
-      element.x = newBounds.x;
+    if (originalElement.width !== undefined) {
+      element.width = originalElement.width * scaleX;
     }
+    positionTextInBounds(element, newBounds);
   } else if (isLine(element)) {
     element.points = remapPoints((originalElement as LineElement).points, startBounds, newBounds) as [Point, Point];
   } else if (isPath(element)) {
     element.points = remapPoints((originalElement as PathElement).points, startBounds, newBounds);
   }
+}
+
+export function applyTextReflow(element: TextElement, newBounds: BoundingBox): void {
+  element.width = Math.max(5, newBounds.width);
+  positionTextInBounds(element, newBounds);
 }
 
 export function applyGroupResize(
@@ -279,10 +291,18 @@ export function applyGroupResize(
 // ─── Rotation ──────────────────────────────────────────────────────────────
 
 function setElementPosition(el: DrawingElement, newPos: Point, textBounds?: TextBoundsMap): void {
-  if (isShape(el) || isText(el)) {
+  if (isShape(el)) {
     const bbox = getBoundingBox(el, textBounds);
     el.x = newPos.x - bbox.width / 2;
     el.y = newPos.y - bbox.height / 2;
+  } else if (isText(el)) {
+    const bbox = getBoundingBox(el, textBounds);
+    positionTextInBounds(el, {
+      x: newPos.x - bbox.width / 2,
+      y: newPos.y - bbox.height / 2,
+      width: bbox.width,
+      height: bbox.height,
+    });
   } else if (isLine(el)) {
     const bbox = getBoundingBox(el);
     const oldCenterX = bbox.x + bbox.width / 2;

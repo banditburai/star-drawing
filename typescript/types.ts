@@ -79,6 +79,7 @@ export interface TextElement extends BaseElement {
   font_size: number;
   font_family: "hand-drawn" | "normal" | "monospace";
   text_align: "left" | "center" | "right";
+  width?: number | undefined; // If set, text wraps at this width (viewBox units)
 }
 
 export type DrawingElement = PathElement | LineElement | ShapeElement | TextElement;

@@ -12,6 +12,9 @@ app, rt = star_app(
     title="star-drawing Demo",
     htmlkw={"lang": "en"},
     hdrs=[
+        Link(rel="preconnect", href="https://fonts.googleapis.com"),
+        Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
+        Link(rel="stylesheet", href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&display=swap"),
         Script(src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"),
         iconify_script(),
         Style("""
@@ -143,17 +146,20 @@ app, rt = star_app(
                 border: 2.5px solid transparent; cursor: pointer;
                 transition: transform 0.1s, border-color 0.1s;
                 padding: 0; flex-shrink: 0;
+                box-shadow: inset 0 0 0 1px rgba(0,0,0,0.1);
             }
             .color-swatch:hover { transform: scale(1.1); border-color: rgba(0,0,0,0.12); }
             .color-swatch.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.25); }
 
-            /* ── Color picker ── */
+            /* ── Color picker (rainbow gradient signals "custom color") ── */
             .color-picker {
                 width: 26px; height: 26px; border: none;
                 border-radius: 6px; cursor: pointer; padding: 0;
+                background: conic-gradient(red, yellow, lime, aqua, blue, magenta, red);
             }
-            .color-picker::-webkit-color-swatch-wrapper { padding: 0; }
-            .color-picker::-webkit-color-swatch { border: 2px solid #d1d5db; border-radius: 6px; }
+            .color-picker::-webkit-color-swatch-wrapper { padding: 2px; }
+            .color-picker::-webkit-color-swatch { border: 2px solid rgba(255,255,255,0.8); border-radius: 4px; }
+            .color-picker::-moz-color-swatch { border: 2px solid rgba(255,255,255,0.8); border-radius: 4px; }
 
             /* ── No-fill swatch (diagonal strikethrough) ── */
             .no-fill-swatch {

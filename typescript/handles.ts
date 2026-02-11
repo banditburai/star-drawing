@@ -13,7 +13,7 @@ import type {
   LineElement,
   Point,
 } from "./types.js";
-import { isLine } from "./types.js";
+import { isLine, isText } from "./types.js";
 
 // ─── Snap indicator ────────────────────────────────────────────────────────
 
@@ -99,8 +99,11 @@ function getHandlePositions(el: DrawingElement, bboxOverride?: BoundingBox): Han
     addHandle("se", bbox.x + bbox.width, bbox.y + bbox.height, cursorForHandle.se);
     addHandle("sw", bbox.x, bbox.y + bbox.height, cursorForHandle.sw);
 
-    // Edge handles (not for text — text scales proportionally from corners only)
-    if (el.type !== "text") {
+    if (isText(el)) {
+      // e/w only: reflow (width) resize; n/s omitted since height is content-derived
+      addHandle("e", bbox.x + bbox.width, cy, cursorForHandle.e);
+      addHandle("w", bbox.x, cy, cursorForHandle.w);
+    } else {
       addHandle("n", cx, bbox.y, cursorForHandle.n);
       addHandle("e", bbox.x + bbox.width, cy, cursorForHandle.e);
       addHandle("s", cx, bbox.y + bbox.height, cursorForHandle.s);
@@ -119,7 +122,6 @@ export function hitTestHandle(
   clientX: number,
   clientY: number,
   selectedIds: Set<string>,
-  _elements: Map<string, DrawingElement>,
 ): Handle | null {
   if (selectedIds.size === 0) return null;
   const target = document.elementFromPoint(clientX, clientY) as SVGElement | null;
@@ -131,7 +133,6 @@ export function hitTestHandle(
 
 // ─── SVG rendering ─────────────────────────────────────────────────────────
 
-// Lazy creation, above elements layer
 export function ensureHandlesGroup(
   existing: SVGGElement | null,
   svg: SVGSVGElement | null,

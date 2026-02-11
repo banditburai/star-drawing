@@ -2,10 +2,65 @@ import type {
   BoundingBox,
   DrawingElement,
   HandleType,
+  LineElement,
+  PathElement,
   Point,
+  ShapeElement,
   TextBoundsMap,
+  TextElement,
 } from "./types.js";
 import { isLine, isShape } from "./types.js";
+import { fontFamilyMap } from "./constants.js";
+
+let _measureCtx: CanvasRenderingContext2D | null = null;
+
+function measureText(text: string, fontSize: number, fontFamily: TextElement["font_family"]): number {
+  if (!_measureCtx) _measureCtx = document.createElement("canvas").getContext("2d")!;
+  const REF = 100;
+  _measureCtx.font = `${REF}px ${fontFamilyMap[fontFamily] || fontFamilyMap.normal}`;
+  return _measureCtx.measureText(text).width * (fontSize / REF);
+}
+
+/** Word-wrap text into lines that fit within maxWidth viewBox units. */
+export function wrapTextToLines(
+  text: string,
+  maxWidth: number,
+  fontSize: number,
+  fontFamily: TextElement["font_family"],
+): string[] {
+  const measure = (s: string) => measureText(s, fontSize, fontFamily);
+  const result: string[] = [];
+
+  for (const rawLine of text.split("\n")) {
+    if (!rawLine) { result.push(""); continue; }
+    const words = rawLine.split(" ");
+    let current = "";
+
+    for (const word of words) {
+      const test = current ? `${current} ${word}` : word;
+      if (current && measure(test) > maxWidth) {
+        result.push(current);
+        current = word;
+      } else {
+        current = test;
+      }
+      // Break words longer than a full line
+      while (measure(current) > maxWidth && current.length > 1) {
+        let lo = 1, hi = current.length;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (measure(current.slice(0, mid)) <= maxWidth) lo = mid;
+          else hi = mid - 1;
+        }
+        result.push(current.slice(0, lo));
+        current = current.slice(lo);
+      }
+    }
+    result.push(current);
+  }
+
+  return result;
+}
 
 // Without rotation applied
 export function getBoundingBox(el: DrawingElement, textBounds?: TextBoundsMap): BoundingBox {
@@ -18,10 +73,12 @@ export function getBoundingBox(el: DrawingElement, textBounds?: TextBoundsMap): 
     case "text": {
       const measured = textBounds?.get(el.id);
       if (measured) return measured;
-      // Approximation fallback for elements not yet rendered in the DOM
-      const lines = el.text.split("\n");
-      const maxLineLen = Math.max(...lines.map((l) => l.length));
-      const approxWidth = maxLineLen * el.font_size * 0.6;
+      // Fallback for elements not yet rendered — textBoundsCache provides real values after render
+      const lines = el.width
+        ? wrapTextToLines(el.text, el.width, el.font_size, el.font_family)
+        : el.text.split("\n");
+      const widest = Math.max(...lines.map((l) => measureText(l, el.font_size, el.font_family)));
+      const approxWidth = el.width ?? widest;
       const approxHeight = el.font_size * 1.2 * lines.length;
       const x = el.text_align === "center" ? el.x - approxWidth / 2
               : el.text_align === "right" ? el.x - approxWidth
@@ -30,10 +87,17 @@ export function getBoundingBox(el: DrawingElement, textBounds?: TextBoundsMap): 
     }
     case "line":
     case "arrow": {
-      const minX = Math.min(el.points[0].x, el.points[1].x);
-      const minY = Math.min(el.points[0].y, el.points[1].y);
-      const maxX = Math.max(el.points[0].x, el.points[1].x);
-      const maxY = Math.max(el.points[0].y, el.points[1].y);
+      let minX = Math.min(el.points[0].x, el.points[1].x);
+      let minY = Math.min(el.points[0].y, el.points[1].y);
+      let maxX = Math.max(el.points[0].x, el.points[1].x);
+      let maxY = Math.max(el.points[0].y, el.points[1].y);
+      if (el.midpoint) {
+        // Quadratic bezier is contained within the convex hull of its 3 points
+        minX = Math.min(minX, el.midpoint.x);
+        minY = Math.min(minY, el.midpoint.y);
+        maxX = Math.max(maxX, el.midpoint.x);
+        maxY = Math.max(maxY, el.midpoint.y);
+      }
       return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
     }
     case "pen":
@@ -275,4 +339,233 @@ export function getRotatedCursor(handleType: HandleType, rotationDeg: number): s
   const angle = ((base + rotationDeg) % 360 + 360) % 360; // normalize to 0-360
   const index = Math.round(angle / 45) % 8;
   return cursorAt45[index];
+}
+
+// ---------------------------------------------------------------------------
+// Geometric hit-testing primitives
+// ---------------------------------------------------------------------------
+
+/** Shortest distance from point (px,py) to line segment (ax,ay)-(bx,by). */
+export function distanceToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/** Ray-casting point-in-polygon test. */
+export function pointInPolygon(px: number, py: number, verts: Point[]): boolean {
+  let inside = false;
+  for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+    const xi = verts[i].x, yi = verts[i].y;
+    const xj = verts[j].x, yj = verts[j].y;
+    if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Min distance from point to any edge of a polygon. */
+export function distanceToPolygonEdge(px: number, py: number, verts: Point[]): number {
+  let minDist = Infinity;
+  for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+    const d = distanceToSegment(px, py, verts[j].x, verts[j].y, verts[i].x, verts[i].y);
+    if (d < minDist) minDist = d;
+  }
+  return minDist;
+}
+
+/** Test if point is inside an axis-aligned ellipse (after un-rotation). */
+export function pointInEllipse(px: number, py: number, cx: number, cy: number, rx: number, ry: number, rotationDeg: number): boolean {
+  const p = rotationDeg !== 0 ? rotatePoint({ x: px, y: py }, { x: cx, y: cy }, -rotationDeg) : { x: px, y: py };
+  if (rx === 0 || ry === 0) return false;
+  const dx = (p.x - cx) / rx;
+  const dy = (p.y - cy) / ry;
+  return dx * dx + dy * dy <= 1;
+}
+
+/** Approximate distance from point to ellipse edge. */
+export function distanceToEllipseEdge(px: number, py: number, cx: number, cy: number, rx: number, ry: number, rotationDeg: number): number {
+  const p = rotationDeg !== 0 ? rotatePoint({ x: px, y: py }, { x: cx, y: cy }, -rotationDeg) : { x: px, y: py };
+  if (rx === 0 || ry === 0) return Math.hypot(p.x - cx, p.y - cy);
+  const angle = Math.atan2((p.y - cy) / ry, (p.x - cx) / rx);
+  const nearX = cx + rx * Math.cos(angle);
+  const nearY = cy + ry * Math.sin(angle);
+  return Math.hypot(p.x - nearX, p.y - nearY);
+}
+
+/** Approximate min distance from point to a quadratic bezier curve. */
+export function distanceToQuadraticBezier(
+  px: number, py: number,
+  x0: number, y0: number,
+  cpx: number, cpy: number,
+  x1: number, y1: number,
+): number {
+  const STEPS = 10;
+  let minDist = Infinity;
+  let prevX = x0, prevY = y0;
+  for (let i = 1; i <= STEPS; i++) {
+    const t = i / STEPS;
+    const mt = 1 - t;
+    const curX = mt * mt * x0 + 2 * mt * t * cpx + t * t * x1;
+    const curY = mt * mt * y0 + 2 * mt * t * cpy + t * t * y1;
+    const d = distanceToSegment(px, py, prevX, prevY, curX, curY);
+    if (d < minDist) minDist = d;
+    prevX = curX;
+    prevY = curY;
+  }
+  return minDist;
+}
+
+// ---------------------------------------------------------------------------
+// Per-shape hit-test functions
+// ---------------------------------------------------------------------------
+
+function hasFill(el: DrawingElement): boolean {
+  return el.fill_color !== "" && el.fill_color !== "none";
+}
+
+function hitTestRect(px: number, py: number, el: ShapeElement, tol: number, textBounds?: TextBoundsMap): boolean {
+  const bbox = getBoundingBox(el, textBounds);
+  const center: Point = { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 };
+  const p = el.rotation !== 0 ? rotatePoint({ x: px, y: py }, center, -el.rotation) : { x: px, y: py };
+  const corners: Point[] = [
+    { x: bbox.x, y: bbox.y },
+    { x: bbox.x + bbox.width, y: bbox.y },
+    { x: bbox.x + bbox.width, y: bbox.y + bbox.height },
+    { x: bbox.x, y: bbox.y + bbox.height },
+  ];
+  if (hasFill(el)) return pointInPolygon(p.x, p.y, corners);
+  return distanceToPolygonEdge(p.x, p.y, corners) <= tol + el.stroke_width / 2;
+}
+
+function hitTestEllipse(px: number, py: number, el: ShapeElement, tol: number, textBounds?: TextBoundsMap): boolean {
+  const bbox = getBoundingBox(el, textBounds);
+  const cx = bbox.x + bbox.width / 2;
+  const cy = bbox.y + bbox.height / 2;
+  const rx = bbox.width / 2;
+  const ry = bbox.height / 2;
+  if (hasFill(el)) return pointInEllipse(px, py, cx, cy, rx + tol, ry + tol, el.rotation);
+  return distanceToEllipseEdge(px, py, cx, cy, rx, ry, el.rotation) <= tol + el.stroke_width / 2;
+}
+
+function hitTestDiamond(px: number, py: number, el: ShapeElement, tol: number, textBounds?: TextBoundsMap): boolean {
+  const bbox = getBoundingBox(el, textBounds);
+  const center: Point = { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 };
+  const p = el.rotation !== 0 ? rotatePoint({ x: px, y: py }, center, -el.rotation) : { x: px, y: py };
+  const verts: Point[] = [
+    { x: center.x, y: bbox.y },             // top
+    { x: bbox.x + bbox.width, y: center.y }, // right
+    { x: center.x, y: bbox.y + bbox.height }, // bottom
+    { x: bbox.x, y: center.y },             // left
+  ];
+  if (hasFill(el)) return pointInPolygon(p.x, p.y, verts);
+  return distanceToPolygonEdge(p.x, p.y, verts) <= tol + el.stroke_width / 2;
+}
+
+function hitTestLine(px: number, py: number, el: LineElement, tol: number): boolean {
+  const halfStroke = el.stroke_width / 2;
+  const threshold = tol + halfStroke;
+  if (el.midpoint) {
+    return distanceToQuadraticBezier(
+      px, py,
+      el.points[0].x, el.points[0].y,
+      el.midpoint.x, el.midpoint.y,
+      el.points[1].x, el.points[1].y,
+    ) <= threshold;
+  }
+  return distanceToSegment(
+    px, py,
+    el.points[0].x, el.points[0].y,
+    el.points[1].x, el.points[1].y,
+  ) <= threshold;
+}
+
+function hitTestPath(px: number, py: number, el: PathElement, tol: number): boolean {
+  const threshold = tol + el.stroke_width / 2;
+  for (let i = 1; i < el.points.length; i++) {
+    if (distanceToSegment(px, py, el.points[i - 1].x, el.points[i - 1].y, el.points[i].x, el.points[i].y) <= threshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hitTestText(px: number, py: number, el: TextElement, tol: number, textBounds?: TextBoundsMap): boolean {
+  const bbox = getBoundingBox(el, textBounds);
+  const center: Point = { x: bbox.x + bbox.width / 2, y: bbox.y + bbox.height / 2 };
+  const p = el.rotation !== 0 ? rotatePoint({ x: px, y: py }, center, -el.rotation) : { x: px, y: py };
+  return p.x >= bbox.x - tol && p.x <= bbox.x + bbox.width + tol &&
+         p.y >= bbox.y - tol && p.y <= bbox.y + bbox.height + tol;
+}
+
+// ---------------------------------------------------------------------------
+// Unified hit-test entry points
+// ---------------------------------------------------------------------------
+
+/** AABB pre-filter using rotated corners, then dispatch to shape-specific test. */
+export function hitTestElement(px: number, py: number, el: DrawingElement, tolerance: number, textBounds?: TextBoundsMap): boolean {
+  // Fast AABB rejection
+  const bbox = getBoundingBox(el, textBounds);
+  const corners = getRotatedCorners(bbox, el.rotation);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const c of corners) {
+    if (c.x < minX) minX = c.x;
+    if (c.y < minY) minY = c.y;
+    if (c.x > maxX) maxX = c.x;
+    if (c.y > maxY) maxY = c.y;
+  }
+  const margin = tolerance + el.stroke_width;
+  if (px < minX - margin || px > maxX + margin || py < minY - margin || py > maxY + margin) {
+    return false;
+  }
+
+  switch (el.type) {
+    case "rect": return hitTestRect(px, py, el, tolerance, textBounds);
+    case "ellipse": return hitTestEllipse(px, py, el, tolerance, textBounds);
+    case "diamond": return hitTestDiamond(px, py, el, tolerance, textBounds);
+    case "line":
+    case "arrow": return hitTestLine(px, py, el, tolerance);
+    case "pen":
+    case "highlighter": return hitTestPath(px, py, el, tolerance);
+    case "text": return hitTestText(px, py, el, tolerance, textBounds);
+    default: return false;
+  }
+}
+
+/** Return all elements hit at (px, py), front-to-back order (last drawn = first). */
+export function getElementsAtPoint(
+  px: number, py: number,
+  elements: Map<string, DrawingElement>,
+  tolerance: number,
+  textBounds?: TextBoundsMap,
+): DrawingElement[] {
+  const hits: DrawingElement[] = [];
+  for (const el of elements.values()) {
+    if (hitTestElement(px, py, el, tolerance, textBounds)) {
+      hits.push(el);
+    }
+  }
+  hits.reverse(); // last drawn (front) first
+  return hits;
+}
+
+/** Return the ID of the topmost (last drawn) element at point, or null. */
+export function getTopmostElementAtPoint(
+  px: number, py: number,
+  elements: Map<string, DrawingElement>,
+  tolerance: number,
+  textBounds?: TextBoundsMap,
+): string | null {
+  // Last match in insertion order = topmost (avoids array allocation)
+  let topmost: string | null = null;
+  for (const el of elements.values()) {
+    if (hitTestElement(px, py, el, tolerance, textBounds)) {
+      topmost = el.id;
+    }
+  }
+  return topmost;
 }

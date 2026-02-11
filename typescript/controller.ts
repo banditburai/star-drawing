@@ -5,8 +5,12 @@ import {
   getAngleFromPoint,
   getBoundingBox,
   getElementCenter,
+  getElementsAtPoint,
   getGroupBoundingBox,
+  getTopmostElementAtPoint,
+  hitTestElement,
   resolveBindingPoint,
+  wrapTextToLines,
 } from "./geometry.js";
 import type { SnapResult } from "./geometry.js";
 import {
@@ -21,6 +25,7 @@ import {
   applyGroupResize,
   applyGroupRotation,
   applyResize,
+  applyTextReflow,
   calculateResizeBounds,
 } from "./transforms.js";
 import { renderElement as renderElementPure } from "./renderers.js";
@@ -53,6 +58,7 @@ interface TextEditState {
   overlay: HTMLTextAreaElement;
   editingId: string | null;
   svgPoint: Point;
+  maxWidthVB: number;
   commitFn: (() => void) | null;
   blurTimeout: ReturnType<typeof setTimeout> | null;
   committed: boolean;
@@ -84,6 +90,8 @@ interface RotationSession {
 export interface DrawingCallbacks {
   onStateChange(patch: Partial<DrawingState>): void;
 }
+
+const HIT_TOLERANCE_PX = 8;
 
 class DrawingController {
   private container: HTMLElement;
@@ -118,6 +126,10 @@ class DrawingController {
 
   private toolSettings: Map<Tool, ToolSettings> = new Map();
   private currentTool: Tool = "select";
+
+  private cycleStack: DrawingElement[] = [];
+  private cycleIndex = 0;
+  private lastCyclePoint: Point | null = null;
 
   private svg: SVGSVGElement | null = null;
   private elementsGroup: SVGGElement | null = null;
@@ -209,15 +221,6 @@ class DrawingController {
     this.svgRect = this.svg?.getBoundingClientRect() ?? null;
   }
 
-  private resolveElementId(target: Element | null): string | null {
-    let el = target;
-    while (el && el !== this.svg) {
-      if (el.id && this.elements.has(el.id)) return el.id;
-      el = el.parentElement;
-    }
-    return null;
-  }
-
   private bindEvents(): void {
     if (!this.svg) return;
     const o = { signal: this.eventAbort.signal };
@@ -248,14 +251,38 @@ class DrawingController {
     }
 
     if (e.key === "Escape") {
+      e.preventDefault();
       if (this.selectedIds.size > 0) {
-        e.preventDefault();
         this.deselectAll();
+      } else if (this.currentTool !== "select") {
+        this.switchTool("select");
       }
       return;
     }
 
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key.startsWith("Arrow") && this.selectedIds.size > 0) {
+      e.preventDefault();
+      const step = e.shiftKey ? 5 : 1;
+      const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+      const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+      this.nudgeSelected(dx, dy);
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey) {
+      const key = e.key.toLowerCase();
+      if (key === "z" && !e.shiftKey) { e.preventDefault(); this.undo(); return; }
+      if (key === "z" && e.shiftKey)  { e.preventDefault(); this.redo(); return; }
+      if (key === "y")                { e.preventDefault(); this.redo(); return; }
+      if (key === "a")                { e.preventDefault(); this.selectAll(); return; }
+      if (key === "d")                { e.preventDefault(); this.duplicateSelected(); return; }
+      if (key === "]")                { e.preventDefault(); this.bringToFront(); return; }
+      if (key === "[")                { e.preventDefault(); this.sendToBack(); return; }
+      return;
+    }
+    if (e.altKey) return;
+
+    // Single-key tool shortcuts
     const toolMap: Record<string, Tool> = {
       v: "select",
       p: "pen",
@@ -271,7 +298,6 @@ class DrawingController {
     const tool = toolMap[e.key.toLowerCase()];
     if (tool) {
       e.preventDefault();
-      // Blur any focused toolbar button so its focus ring doesn't linger
       if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
       this.switchTool(tool);
     }
@@ -293,7 +319,7 @@ class DrawingController {
     }
 
     if (tool === "select" && this.selectedIds.size > 0) {
-      const handle = hitTestHandle(e.clientX, e.clientY, this.selectedIds, this.elements);
+      const handle = hitTestHandle(e.clientX, e.clientY, this.selectedIds);
       if (handle) {
         e.preventDefault();
         this.svg?.setPointerCapture(e.pointerId);
@@ -398,25 +424,30 @@ class DrawingController {
       e.preventDefault();
       this.svg?.setPointerCapture(e.pointerId);
       this.isErasing = true;
-      this.eraseAtPoint(e.clientX, e.clientY);
+      this.eraseAtPoint(point);
       return;
     }
 
     if (tool === "select") {
       e.preventDefault();
-      const target = document.elementFromPoint(e.clientX, e.clientY);
-      const clickedId = this.resolveElementId(target);
-
+      const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
       const now = Date.now();
-      if (clickedId && clickedId === this.lastClickId && now - this.lastClickTime < 400) {
-        const el = this.elements.get(clickedId);
-        if (el && isText(el)) {
+
+      // Double-click to edit text: check BEFORE cycling. Uses hitTestElement on
+      // lastClickId so it works on cycled-to text (not just topmost).
+      if (this.lastClickId && now - this.lastClickTime < 400) {
+        const el = this.elements.get(this.lastClickId);
+        if (el && isText(el) && hitTestElement(point.x, point.y, el, tol, this.textBoundsCache)) {
           this.startTextEditing({ x: el.x, y: el.y }, el);
           this.lastClickTime = 0;
           this.lastClickId = null;
           return;
         }
       }
+
+      const cycleEl = e.shiftKey ? null : this.getClickCycleElement(point);
+      const clickedId = cycleEl?.id ?? getTopmostElementAtPoint(point.x, point.y, this.elements, tol, this.textBoundsCache);
+
       this.lastClickTime = now;
       this.lastClickId = clickedId;
 
@@ -426,7 +457,11 @@ class DrawingController {
         return;
       }
 
-      this.selectAtPoint(e.clientX, e.clientY, e.shiftKey);
+      if (clickedId) {
+        this.selectElement(clickedId, e.shiftKey);
+      } else {
+        if (!e.shiftKey) this.deselectAll();
+      }
 
       if (clickedId && this.selectedIds.has(clickedId)) {
         this.svg?.setPointerCapture(e.pointerId);
@@ -437,7 +472,6 @@ class DrawingController {
 
     if (tool === "text") {
       e.preventDefault();
-      const point = this.pointerToSvgCoords(e);
       this.startTextEditing(point);
       return;
     }
@@ -459,12 +493,24 @@ class DrawingController {
     const pos = this.svgToContainerPx(svgPoint.x, svgPoint.y);
     const fontSizePx = this.svgUnitsToPx(fs, "y");
 
-    const textarea = this.createTextOverlay(pos, fontSizePx, rect.width / rect.height, fm, ta, color, existingElement?.text);
+    // Max-width for text wrapping. Uses "y" axis because the textarea has
+    // scaleX(rect.width/rect.height) — its CSS px map to viewBox units via rect.height.
+    const existingWidth = existingElement?.width;
+    const availableVB = existingWidth ?? (
+      ta === "center" ? 2 * Math.min(svgPoint.x, 100 - svgPoint.x) - 4
+      : ta === "right" ? svgPoint.x - 2
+      : 98 - svgPoint.x
+    );
+    const maxWidthVB = Math.max(10, availableVB);
+    const maxWidthPx = this.svgUnitsToPx(maxWidthVB, "y");
+
+    const textarea = this.createTextOverlay(pos, fontSizePx, rect.width / rect.height, fm, ta, color, existingElement?.text, maxWidthPx);
 
     const state: TextEditState = {
       overlay: textarea,
       editingId: existingElement?.id ?? null,
       svgPoint,
+      maxWidthVB,
       commitFn: null,
       blurTimeout: null,
       committed: false,
@@ -514,14 +560,26 @@ class DrawingController {
     });
   }
 
+  private textNeedsWrapping(text: string, maxWidthVB: number, fontSize: number, fontFamily: TextElement["font_family"]): boolean {
+    const rawLines = text.split("\n").length;
+    return wrapTextToLines(text, maxWidthVB, fontSize, fontFamily).length > rawLines;
+  }
+
   private commitTextEdit(text: string): void {
     if (!this.textEdit) return;
     const svgPoint = this.textEdit.svgPoint;
+    const maxWidthVB = this.textEdit.maxWidthVB;
 
     if (this.textEdit.editingId) {
       const el = this.elements.get(this.textEdit.editingId) as TextElement | undefined;
       if (el) {
+        const before = cloneElement(el);
         el.text = text;
+        el.width = this.textNeedsWrapping(text, maxWidthVB, el.font_size, el.font_family)
+          ? maxWidthVB : undefined;
+        if (el.text !== before.text || el.width !== before.width) {
+          this.pushUndo({ action: "modify", data: [{ id: el.id, before, after: cloneElement(el) }] });
+        }
         this.rerenderElements();
       }
     } else {
@@ -532,6 +590,7 @@ class DrawingController {
       const color = this.state.stroke_color;
       const opacity = this.state.opacity;
       const layer = this.state.active_layer;
+      const needsWrap = this.textNeedsWrapping(text, maxWidthVB, fs, fm);
 
       const textElement: TextElement = {
         id: `text-${crypto.randomUUID().split("-")[0]}`,
@@ -551,6 +610,7 @@ class DrawingController {
         font_size: fs,
         font_family: fm,
         text_align: ta,
+        width: needsWrap ? maxWidthVB : undefined,
       };
 
       this.elements.set(textElement.id, textElement);
@@ -585,6 +645,7 @@ class DrawingController {
     textAlign: TextElement["text_align"],
     color: string,
     existingText?: string,
+    maxWidthPx?: number,
   ): HTMLTextAreaElement {
     const textarea = document.createElement("textarea");
     textarea.className = "drawing-text-input";
@@ -601,14 +662,26 @@ class DrawingController {
       transformOrigin: "0 0",
       transform: this.computeTextTransform(textAlign, stretchX),
     });
+    if (maxWidthPx) {
+      textarea.style.maxWidth = `${maxWidthPx}px`;
+      textarea.style.whiteSpace = "pre-wrap";
+      textarea.style.overflowWrap = "break-word";
+    }
     return textarea;
   }
 
   private autoResizeTextarea(textarea: HTMLTextAreaElement): void {
+    const maxW = parseFloat(textarea.style.maxWidth) || Infinity;
+    // Temporarily disable wrapping to measure natural content width,
+    // avoiding the circular dependency where pre-wrap wraps at auto-width
+    const savedWS = textarea.style.whiteSpace;
+    textarea.style.whiteSpace = "nowrap";
+    textarea.style.width = "auto";
+    const naturalWidth = textarea.scrollWidth + 2;
+    textarea.style.whiteSpace = savedWS;
+    textarea.style.width = `${Math.min(Math.max(40, naturalWidth), maxW)}px`;
     textarea.style.height = "auto";
     textarea.style.height = `${textarea.scrollHeight}px`;
-    textarea.style.width = "auto";
-    textarea.style.width = `${Math.max(40, textarea.scrollWidth + 4)}px`;
   }
 
   private closeTextOverlay(): void {
@@ -653,16 +726,6 @@ class DrawingController {
       this.textEdit.blurTimeout = null;
     }
     this.textEdit.overlay.focus();
-  }
-
-  private selectAtPoint(clientX: number, clientY: number, additive: boolean): void {
-    const target = document.elementFromPoint(clientX, clientY);
-    const id = this.resolveElementId(target);
-    if (!id) {
-      if (!additive) this.deselectAll();
-      return;
-    }
-    this.selectElement(id, additive);
   }
 
   private startDragging(point: Point): void {
@@ -821,9 +884,9 @@ class DrawingController {
     this.updateCursor();
   }
 
-  private eraseAtPoint(clientX: number, clientY: number): void {
-    const target = document.elementFromPoint(clientX, clientY);
-    const id = this.resolveElementId(target);
+  private eraseAtPoint(svgPoint: Point): void {
+    const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const id = getTopmostElementAtPoint(svgPoint.x, svgPoint.y, this.elements, tol, this.textBoundsCache);
     if (!id) return;
 
     const element = this.elements.get(id);
@@ -933,7 +996,7 @@ class DrawingController {
     }
 
     if (this.isErasing) {
-      this.eraseAtPoint(e.clientX, e.clientY);
+      this.eraseAtPoint(point);
       return;
     }
 
@@ -1025,12 +1088,14 @@ class DrawingController {
       const element = this.resizing.elementId ? this.elements.get(this.resizing.elementId) : undefined;
       const isTextEl = element ? isText(element) : false;
 
+      const isTextReflow = isTextEl && (this.activeHandle === "e" || this.activeHandle === "w");
+
       const newBounds = calculateResizeBounds({
         handleType: this.activeHandle as ResizeHandleType,
         startBounds: this.resizing.startBounds,
         dx, dy,
         rotation,
-        maintainAspectRatio: e.shiftKey || isTextEl,
+        maintainAspectRatio: isTextReflow ? false : (e.shiftKey || isTextEl),
         resizeFromCenter: e.altKey,
       });
 
@@ -1040,10 +1105,14 @@ class DrawingController {
         this.updateBoundArrows(groupIds);
         this.rerenderElementSet(groupIds);
       } else if (element && this.resizing.originalElement) {
-        if (isText(element) && this.resizing.originalFontSize === null) {
-          this.resizing.originalFontSize = element.font_size;
+        if (isTextReflow) {
+          applyTextReflow(element as TextElement, newBounds);
+        } else {
+          if (isText(element) && this.resizing.originalFontSize === null) {
+            this.resizing.originalFontSize = element.font_size;
+          }
+          applyResize(element, newBounds, this.resizing.startBounds, this.resizing.originalElement, this.resizing.originalFontSize ?? undefined);
         }
-        applyResize(element, newBounds, this.resizing.startBounds, this.resizing.originalElement, this.resizing.originalFontSize ?? undefined);
         const ids = new Set([this.resizing.elementId!]);
         this.updateBoundArrows(ids);
         this.rerenderElementSet(ids);
@@ -1053,8 +1122,8 @@ class DrawingController {
 
     const tool = this.currentTool;
     if (tool === "select" && this.svg) {
-      const target = document.elementFromPoint(e.clientX, e.clientY);
-      const hoveredId = this.resolveElementId(target);
+      const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+      const hoveredId = getTopmostElementAtPoint(point.x, point.y, this.elements, tol, this.textBoundsCache);
 
       if (hoveredId && this.selectedIds.has(hoveredId)) {
         this.svg.style.cursor = "move";
@@ -1107,6 +1176,39 @@ class DrawingController {
     const rect = this.svgRect;
     if (!rect) return 0;
     return axis === "x" ? (units / 100) * rect.width : (units / 100) * rect.height;
+  }
+
+  /** Convert screen pixels to viewBox units for hit-test tolerance. */
+  private screenToViewBoxTolerance(px: number): number {
+    const rect = this.svgRect;
+    if (!rect) return 1;
+    return (px / Math.min(rect.width, rect.height)) * 100;
+  }
+
+  private getClickCycleElement(svgPoint: Point): DrawingElement | null {
+    const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const sameSpot = tol * 0.5;
+
+    if (this.lastCyclePoint &&
+        Math.abs(svgPoint.x - this.lastCyclePoint.x) < sameSpot &&
+        Math.abs(svgPoint.y - this.lastCyclePoint.y) < sameSpot &&
+        this.cycleStack.length > 0) {
+      this.cycleIndex = (this.cycleIndex + 1) % this.cycleStack.length;
+      return this.cycleStack[this.cycleIndex];
+    }
+
+    this.cycleStack = getElementsAtPoint(svgPoint.x, svgPoint.y, this.elements, tol, this.textBoundsCache);
+    this.cycleIndex = 0;
+    this.lastCyclePoint = svgPoint;
+    return this.cycleStack[0] ?? null;
+  }
+
+  private resetCycleState(): void {
+    this.cycleStack = [];
+    this.cycleIndex = 0;
+    this.lastCyclePoint = null;
+    this.lastClickTime = 0;
+    this.lastClickId = null;
   }
 
   private updatePreview(): void {
@@ -1171,7 +1273,6 @@ class DrawingController {
     } catch { /* element not measurable yet */ }
   }
 
-  /** Measure all rendered text elements and rebuild the cache. */
   private rebuildTextBoundsCache(): void {
     this.textBoundsCache.clear();
     for (const [id, el] of this.elements) {
@@ -1351,7 +1452,6 @@ class DrawingController {
     if (changed.length > 0) {
       this.rerenderElements();
 
-      // If textarea overlay is open for one of the changed elements, update it
       if (this.textEdit && this.textEdit.editingId) {
         const editedEl = changed.find(t => t.id === this.textEdit!.editingId);
         if (editedEl) this.updateTextOverlay(editedEl);
@@ -1430,13 +1530,13 @@ class DrawingController {
 
   switchTool(newTool: Tool): void {
     if (newTool === this.currentTool) return;
+    this.resetCycleState();
     this.saveCurrentToolSettings();
     const settings = this.toolSettings.get(newTool) ?? TOOL_DEFAULTS[newTool];
     this.loadToolSettings(settings);
 
     this.currentTool = newTool;
-    // Clear stale selection when switching to a drawing tool so toolbar
-    // signals (selected_is_text, selected_is_line) don't persist
+    // Prevent toolbar signals (selected_is_text, selected_is_line) from persisting
     if (newTool !== "select") this.deselectAll();
     this.setState({ tool: newTool });
     this.updateCursor();
@@ -1856,6 +1956,7 @@ class DrawingController {
 
   deselectAll(): void {
     this.selectedIds.clear();
+    this.resetCycleState();
     // Update signal store BEFORE rendering handles (renderHandles reads from store)
     this.setState({ selected_ids: [], selected_is_line: false, selected_is_text: false });
     this.updateSelectionVisual();
@@ -1913,6 +2014,60 @@ class DrawingController {
 
     this.setState({ selected_ids: newIds });
     this.updateSelectionVisual();
+  }
+
+  private nudgeSelected(dx: number, dy: number): void {
+    if (this.selectedIds.size === 0) return;
+    const moveData: Array<{ id: string; before: MovePosition; after: MovePosition }> = [];
+    for (const id of this.selectedIds) {
+      const el = this.elements.get(id);
+      if (!el) continue;
+      if (isShape(el) || isText(el)) {
+        const before = { x: el.x, y: el.y };
+        el.x += dx;
+        el.y += dy;
+        moveData.push({ id, before, after: { x: el.x, y: el.y } });
+      } else if (isLine(el)) {
+        const before: MovePosition = {
+          points: el.points.map(p => ({ ...p })),
+          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
+        };
+        el.points = el.points.map(p => ({ x: p.x + dx, y: p.y + dy })) as [Point, Point];
+        if (el.midpoint) el.midpoint = { x: el.midpoint.x + dx, y: el.midpoint.y + dy };
+        moveData.push({ id, before, after: {
+          points: el.points.map(p => ({ ...p })),
+          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
+        }});
+      } else if (isPath(el)) {
+        const before: MovePosition = { points: el.points.map(p => ({ ...p })) };
+        el.points = el.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
+        moveData.push({ id, before, after: { points: el.points.map(p => ({ ...p })) } });
+      }
+    }
+    // Capture bound arrow positions before updateBoundArrows mutates them
+    const ids = new Set(this.selectedIds);
+    const boundArrowsBefore = new Map<string, MovePosition>();
+    for (const [id, el] of this.elements) {
+      if (ids.has(id) || !isLine(el)) continue;
+      if ((el.startBinding && ids.has(el.startBinding.elementId)) ||
+          (el.endBinding && ids.has(el.endBinding.elementId))) {
+        boundArrowsBefore.set(id, {
+          points: el.points.map(p => ({ ...p })),
+          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
+        });
+      }
+    }
+    this.updateBoundArrows(ids);
+    for (const [id, before] of boundArrowsBefore) {
+      const el = this.elements.get(id);
+      if (!el || !isLine(el)) continue;
+      moveData.push({ id, before, after: {
+        points: el.points.map(p => ({ ...p })),
+        midpoint: el.midpoint ? { ...el.midpoint } : undefined,
+      }});
+    }
+    if (moveData.length > 0) this.pushUndo({ action: "move", data: moveData });
+    this.rerenderElementSet(ids);
   }
 
   private analyzeSelectionTypes(): { hasLine: boolean; hasText: boolean } {

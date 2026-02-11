@@ -1,5 +1,5 @@
 import { fontFamilyMap, textAnchorMap } from "./constants.js";
-import { getBoundingBox, pointsToPath } from "./geometry.js";
+import { getBoundingBox, pointsToPath, wrapTextToLines } from "./geometry.js";
 import type {
   ArrowheadStyle,
   BaseElement,
@@ -360,7 +360,10 @@ export function renderText(el: TextElement, textBounds?: TextBoundsMap): SVGText
   text.setAttribute("dominant-baseline", "text-before-edge");
   text.setAttribute("opacity", String(el.opacity));
 
-  const lines = el.text.split("\n");
+  const lines = el.width
+    ? wrapTextToLines(el.text, el.width, el.font_size, el.font_family)
+    : el.text.split("\n");
+
   if (lines.length > 1) {
     for (let i = 0; i < lines.length; i++) {
       const tspan = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
