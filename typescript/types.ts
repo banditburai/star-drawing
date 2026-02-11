@@ -1,11 +1,5 @@
-/**
- * Type definitions for the drawing plugin
- */
-
-// Arrowhead styles for line/arrow endpoints
 export type ArrowheadStyle = "none" | "arrow" | "triangle" | "circle" | "bar" | "diamond";
 
-// Tool types
 export type Tool =
   | "select"
   | "pen"
@@ -20,7 +14,6 @@ export type Tool =
 
 export type Layer = "background" | "default" | "foreground";
 
-// Geometry types
 export interface Point {
   x: number; // 0-100 percentage
   y: number;
@@ -33,7 +26,9 @@ export interface BoundingBox {
   height: number;
 }
 
-// Element types
+/** Map from element ID → measured bounding box. Used to override text approximation with SVG getBBox() results. */
+export type TextBoundsMap = ReadonlyMap<string, BoundingBox>;
+
 export interface BaseElement {
   id: string;
   type: Tool;
@@ -63,7 +58,6 @@ export interface LineElement extends BaseElement {
   endBinding?: Binding | undefined;
 }
 
-// Binding for connecting arrows to shapes
 export interface Binding {
   elementId: string;       // ID of the bound shape
   anchor: Point;           // Normalized 0-1 within shape's bounding box
@@ -89,7 +83,6 @@ export interface TextElement extends BaseElement {
 
 export type DrawingElement = PathElement | LineElement | ShapeElement | TextElement;
 
-// Type guards
 export const isLine = (el: DrawingElement): el is LineElement =>
   el.type === "line" || el.type === "arrow";
 export const isShape = (el: DrawingElement): el is ShapeElement =>
@@ -99,7 +92,6 @@ export const isPath = (el: DrawingElement): el is PathElement =>
 export const isText = (el: DrawingElement): el is TextElement =>
   el.type === "text";
 
-// Handle types for selection manipulation
 export type HandleType =
   | "nw"
   | "n"
@@ -121,7 +113,6 @@ export interface Handle {
   cursor: string;
 }
 
-// Per-tool settings for remembering each tool's last-used configuration
 export interface ToolSettings {
   stroke_width?: number;
   opacity?: number;
@@ -133,7 +124,6 @@ export interface ToolSettings {
   end_arrowhead?: ArrowheadStyle;
 }
 
-// Configuration
 export interface DrawingConfig {
   signal: string;
   defaultStrokeColor: string;
@@ -145,13 +135,21 @@ export interface DrawingConfig {
   throttleMs: number;
 }
 
-// Resize handle types (subset of HandleType, excludes rotation/start/end/midpoint)
 export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
-// Position types for move operations
+export type StyleProperty =
+  | "stroke_color"
+  | "fill_color"
+  | "stroke_width"
+  | "opacity"
+  | "dash_length"
+  | "dash_gap"
+  | "start_arrowhead"
+  | "end_arrowhead";
+
 export type MovePosition = { x: number; y: number } | { points: Point[]; midpoint?: Point | undefined };
 
-// State contract between TypeScript controller and host framework (e.g. Datastar signals)
+// Typed contract between TypeScript controller and Datastar signals
 export interface DrawingState {
   tool: Tool;
   is_drawing: boolean;
@@ -176,7 +174,6 @@ export interface DrawingState {
   selected_is_text: boolean;
 }
 
-// Group resize state for multi-selection resize
 export interface GroupResizeState {
   elements: Array<{
     id: string;
@@ -187,7 +184,6 @@ export interface GroupResizeState {
   groupBounds: BoundingBox;
 }
 
-// Group rotation state for multi-selection rotation
 export interface GroupRotationState {
   elements: Array<{
     id: string;
@@ -199,10 +195,10 @@ export interface GroupRotationState {
   startAngle: number;
 }
 
-// Undo/Redo action types (discriminated union for type safety)
 export type UndoAction =
   | { action: "add"; data: DrawingElement }
   | { action: "remove"; data: DrawingElement }
+  | { action: "remove_batch"; data: DrawingElement[] }
   | {
       action: "move";
       data: Array<{
@@ -211,13 +207,4 @@ export type UndoAction =
         after: MovePosition;
       }>;
     }
-  | { action: "resize"; data: { id: string; before: DrawingElement; after: DrawingElement } }
-  | { action: "rotate"; data: { id: string; before: DrawingElement; after: DrawingElement } }
-  | {
-      action: "group-resize";
-      data: Array<{ id: string; before: DrawingElement; after: DrawingElement }>;
-    }
-  | {
-      action: "group-rotate";
-      data: Array<{ id: string; before: DrawingElement; after: DrawingElement }>;
-    };
+  | { action: "modify"; data: Array<{ id: string; before: DrawingElement; after: DrawingElement }> };

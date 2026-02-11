@@ -1,20 +1,14 @@
-/**
- * Geometry utilities for the drawing plugin
- * All functions are pure - no side effects or external dependencies
- */
-
 import type {
   BoundingBox,
   DrawingElement,
   HandleType,
   Point,
+  TextBoundsMap,
 } from "./types.js";
 import { isLine, isShape } from "./types.js";
 
-/**
- * Get bounding box for an element (without rotation applied)
- */
-export function getBoundingBox(el: DrawingElement): BoundingBox {
+// Without rotation applied
+export function getBoundingBox(el: DrawingElement, textBounds?: TextBoundsMap): BoundingBox {
   switch (el.type) {
     case "rect":
     case "ellipse":
@@ -22,12 +16,13 @@ export function getBoundingBox(el: DrawingElement): BoundingBox {
       return { x: el.x, y: el.y, width: el.width, height: el.height };
     }
     case "text": {
+      const measured = textBounds?.get(el.id);
+      if (measured) return measured;
+      // Approximation fallback for elements not yet rendered in the DOM
       const lines = el.text.split("\n");
       const maxLineLen = Math.max(...lines.map((l) => l.length));
       const approxWidth = maxLineLen * el.font_size * 0.6;
       const approxHeight = el.font_size * 1.2 * lines.length;
-      // With dominant-baseline: text-before-edge, el.y is the top of the text.
-      // Adjust x based on text alignment (text-anchor shifts the origin).
       const x = el.text_align === "center" ? el.x - approxWidth / 2
               : el.text_align === "right" ? el.x - approxWidth
               : el.x;
@@ -46,12 +41,14 @@ export function getBoundingBox(el: DrawingElement): BoundingBox {
       if (el.points.length === 0) {
         return { x: 0, y: 0, width: 0, height: 0 };
       }
-      const xs = el.points.map((p) => p.x);
-      const ys = el.points.map((p) => p.y);
-      const minX = Math.min(...xs);
-      const minY = Math.min(...ys);
-      const maxX = Math.max(...xs);
-      const maxY = Math.max(...ys);
+      // Single-pass to avoid Math.min(...spread) stack overflow on large freehand paths
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of el.points) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
       return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
     }
     default:
@@ -59,23 +56,16 @@ export function getBoundingBox(el: DrawingElement): BoundingBox {
   }
 }
 
-/**
- * Get element center point for rotation calculations
- */
-export function getElementCenter(el: DrawingElement): Point {
-  const bbox = getBoundingBox(el);
+export function getElementCenter(el: DrawingElement, textBounds?: TextBoundsMap): Point {
+  const bbox = getBoundingBox(el, textBounds);
   return {
     x: bbox.x + bbox.width / 2,
     y: bbox.y + bbox.height / 2,
   };
 }
 
-/**
- * Get the four corners of a bounding box after rotation
- */
 export function getRotatedCorners(bbox: BoundingBox, rotation: number): Point[] {
   if (rotation === 0) {
-    // No rotation - return original corners
     return [
       { x: bbox.x, y: bbox.y },
       { x: bbox.x + bbox.width, y: bbox.y },
@@ -84,7 +74,6 @@ export function getRotatedCorners(bbox: BoundingBox, rotation: number): Point[] 
     ];
   }
 
-  // Rotate corners around center
   const cx = bbox.x + bbox.width / 2;
   const cy = bbox.y + bbox.height / 2;
   const angleRad = (rotation * Math.PI) / 180;
@@ -108,10 +97,7 @@ export function getRotatedCorners(bbox: BoundingBox, rotation: number): Point[] 
   });
 }
 
-/**
- * Get combined bounding box for multiple elements, accounting for rotation
- */
-export function getGroupBoundingBox(elements: DrawingElement[]): BoundingBox {
+export function getGroupBoundingBox(elements: DrawingElement[], textBounds?: TextBoundsMap): BoundingBox {
   if (elements.length === 0) return { x: 0, y: 0, width: 0, height: 0 };
 
   let minX = Number.POSITIVE_INFINITY;
@@ -120,8 +106,7 @@ export function getGroupBoundingBox(elements: DrawingElement[]): BoundingBox {
   let maxY = Number.NEGATIVE_INFINITY;
 
   for (const el of elements) {
-    const bbox = getBoundingBox(el);
-    // Account for rotation by computing rotated corners
+    const bbox = getBoundingBox(el, textBounds);
     const corners = getRotatedCorners(bbox, el.rotation);
     for (const corner of corners) {
       minX = Math.min(minX, corner.x);
@@ -134,9 +119,6 @@ export function getGroupBoundingBox(elements: DrawingElement[]): BoundingBox {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
-/**
- * Rotate a point around a center by angleDeg degrees
- */
 export function rotatePoint(point: Point, center: Point, angleDeg: number): Point {
   const angleRad = (angleDeg * Math.PI) / 180;
   const cos = Math.cos(angleRad);
@@ -149,9 +131,6 @@ export function rotatePoint(point: Point, center: Point, angleDeg: number): Poin
   };
 }
 
-/**
- * Convert points array to SVG path string with smooth curves
- */
 export function pointsToPath(points: Point[]): string {
   if (points.length === 0) return "";
   if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
@@ -169,33 +148,25 @@ export function pointsToPath(points: Point[]): string {
   return d;
 }
 
-/**
- * Calculate angle in degrees from a point to a center
- * Used for rotation calculations
- */
 export function getAngleFromPoint(point: Point, center: Point): number {
   return (Math.atan2(point.y - center.y, point.x - center.x) * 180) / Math.PI;
 }
 
-/**
- * Deep clone a drawing element
- * More efficient than JSON.parse/JSON.stringify for known structures
- */
+// More efficient than JSON.parse/JSON.stringify for known structures
 export function cloneElement<T extends DrawingElement>(el: T): T {
-  // Handle different element types appropriately
   if ("points" in el) {
     const clone = {
       ...el,
       points: (el.points as Point[]).map((p) => ({ ...p })),
     } as T;
-    // Deep clone midpoint and bindings for LineElement
-    const lineClone = clone as any;
-    if (lineClone.midpoint) lineClone.midpoint = { ...lineClone.midpoint };
-    if (lineClone.startBinding) lineClone.startBinding = { ...lineClone.startBinding, anchor: { ...lineClone.startBinding.anchor } };
-    if (lineClone.endBinding) lineClone.endBinding = { ...lineClone.endBinding, anchor: { ...lineClone.endBinding.anchor } };
+    if (isLine(el)) {
+      const lineClone = clone as T & { midpoint?: Point; startBinding?: { elementId: string; anchor: Point }; endBinding?: { elementId: string; anchor: Point } };
+      if (lineClone.midpoint) lineClone.midpoint = { ...lineClone.midpoint };
+      if (lineClone.startBinding) lineClone.startBinding = { ...lineClone.startBinding, anchor: { ...lineClone.startBinding.anchor } };
+      if (lineClone.endBinding) lineClone.endBinding = { ...lineClone.endBinding, anchor: { ...lineClone.endBinding.anchor } };
+    }
     return clone;
   }
-  // For elements without points, shallow clone is sufficient
   return { ...el } as T;
 }
 
@@ -218,9 +189,6 @@ const cursorAt45: string[] = [
   "nwse-resize",  // 315
 ];
 
-/**
- * Snap result containing the snapped point and optional binding info
- */
 export interface SnapResult {
   point: Point;
   elementId?: string;     // Shape that was snapped to
@@ -230,7 +198,6 @@ export interface SnapResult {
 /**
  * Find the nearest snap point within threshold distance.
  * Checks line/arrow endpoints and shape edge midpoints (rotated).
- * Returns the closest snap result or null if none within threshold.
  */
 export function findSnapPoint(
   point: Point,
@@ -247,14 +214,12 @@ export function findSnapPoint(
     const candidates: Array<{ point: Point; elementId?: string; anchor?: Point }> = [];
 
     if (isLine(el)) {
-      // Line endpoints snap but don't create bindings
       candidates.push({ point: el.points[0] });
       candidates.push({ point: el.points[1] });
     } else if (isShape(el)) {
       const cx = el.x + el.width / 2;
       const cy = el.y + el.height / 2;
       const center: Point = { x: cx, y: cy };
-      // Edge midpoints with normalized anchors
       const edgeMidpoints: Array<{ point: Point; anchor: Point }> = [
         { point: { x: cx, y: el.y }, anchor: { x: 0.5, y: 0 } },           // top
         { point: { x: el.x + el.width, y: cy }, anchor: { x: 1, y: 0.5 } }, // right
@@ -288,16 +253,17 @@ export function findSnapPoint(
 export function resolveBindingPoint(
   binding: { elementId: string; anchor: Point },
   elements: Map<string, DrawingElement>,
+  textBounds?: TextBoundsMap,
 ): Point | null {
   const target = elements.get(binding.elementId);
   if (!target) return null;
-  const bbox = getBoundingBox(target);
+  const bbox = getBoundingBox(target, textBounds);
   const point: Point = {
     x: bbox.x + binding.anchor.x * bbox.width,
     y: bbox.y + binding.anchor.y * bbox.height,
   };
   if (target.rotation !== 0) {
-    const center = getElementCenter(target);
+    const center = getElementCenter(target, textBounds);
     return rotatePoint(point, center, target.rotation);
   }
   return point;

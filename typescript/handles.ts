@@ -1,7 +1,3 @@
-/**
- * Handle positions, hit testing, and SVG rendering for selection handles.
- */
-
 import { cursorForHandle } from "./constants.js";
 import {
   getBoundingBox,
@@ -10,9 +6,11 @@ import {
   rotatePoint,
 } from "./geometry.js";
 import type {
+  BoundingBox,
   DrawingElement,
   Handle,
   HandleType,
+  LineElement,
   Point,
 } from "./types.js";
 import { isLine } from "./types.js";
@@ -31,61 +29,57 @@ export function createSnapIndicator(point: Point): SVGCircleElement {
   return circle;
 }
 
+// ─── Midpoint position ────────────────────────────────────────────────────
+
+/** Returns the effective midpoint handle position for a line element.
+ *  Uses the stored midpoint if set, otherwise computes a perpendicular offset from the line center. */
+export function getLineMidpointPosition(el: LineElement): Point {
+  if (el.midpoint) return { x: el.midpoint.x, y: el.midpoint.y };
+
+  const centerX = (el.points[0].x + el.points[1].x) / 2;
+  const centerY = (el.points[0].y + el.points[1].y) / 2;
+
+  const dx = el.points[1].x - el.points[0].x;
+  const dy = el.points[1].y - el.points[0].y;
+  const length = Math.sqrt(dx * dx + dy * dy);
+
+  if (length > 0.1) {
+    const perpX = -dy / length;
+    const perpY = dx / length;
+    const offset = 2;
+    return { x: centerX + perpX * offset, y: centerY + perpY * offset };
+  }
+  return { x: centerX, y: centerY };
+}
+
 // ─── Handle positions ──────────────────────────────────────────────────────
 
-/** Compute handle positions for a single element. */
-export function getHandlePositions(el: DrawingElement): Handle[] {
+function getHandlePositions(el: DrawingElement, bboxOverride?: BoundingBox): Handle[] {
   const handles: Handle[] = [];
 
   if (isLine(el)) {
-    const line = el;
     handles.push({
       type: "start",
-      x: line.points[0].x,
-      y: line.points[0].y,
+      x: el.points[0].x,
+      y: el.points[0].y,
       cursor: cursorForHandle.start,
     });
     handles.push({
       type: "end",
-      x: line.points[1].x,
-      y: line.points[1].y,
+      x: el.points[1].x,
+      y: el.points[1].y,
       cursor: cursorForHandle.end,
     });
 
-    // Midpoint: if curved, use control point; otherwise offset perpendicular
-    let midX: number, midY: number;
-    if (line.midpoint) {
-      midX = line.midpoint.x;
-      midY = line.midpoint.y;
-    } else {
-      const centerX = (line.points[0].x + line.points[1].x) / 2;
-      const centerY = (line.points[0].y + line.points[1].y) / 2;
-
-      const dx = line.points[1].x - line.points[0].x;
-      const dy = line.points[1].y - line.points[0].y;
-      const length = Math.sqrt(dx * dx + dy * dy);
-
-      if (length > 0.1) {
-        const perpX = -dy / length;
-        const perpY = dx / length;
-        const offset = 2;
-        midX = centerX + perpX * offset;
-        midY = centerY + perpY * offset;
-      } else {
-        midX = centerX;
-        midY = centerY;
-      }
-    }
-
+    const mid = getLineMidpointPosition(el);
     handles.push({
       type: "midpoint",
-      x: midX,
-      y: midY,
+      x: mid.x,
+      y: mid.y,
       cursor: cursorForHandle.midpoint,
     });
   } else {
-    // Shapes, text, and paths get resize handles + rotation handle
-    const bbox = getBoundingBox(el);
+    const bbox = bboxOverride ?? getBoundingBox(el);
     const cx = bbox.x + bbox.width / 2;
     const cy = bbox.y + bbox.height / 2;
     const center = { x: cx, y: cy };
@@ -121,32 +115,23 @@ export function getHandlePositions(el: DrawingElement): Handle[] {
 
 // ─── Hit testing ───────────────────────────────────────────────────────────
 
-/** Check if a client coordinate hits any rendered handle. */
 export function hitTestHandle(
   clientX: number,
   clientY: number,
   selectedIds: Set<string>,
-  elements: Map<string, DrawingElement>,
+  _elements: Map<string, DrawingElement>,
 ): Handle | null {
+  if (selectedIds.size === 0) return null;
   const target = document.elementFromPoint(clientX, clientY) as SVGElement | null;
   if (!target) return null;
-
   const handleType = target.getAttribute("data-handle") as HandleType | null;
   if (!handleType) return null;
-
-  if (selectedIds.size !== 1) return null;
-
-  const selectedId = Array.from(selectedIds)[0];
-  const element = elements.get(selectedId);
-  if (!element) return null;
-
-  const handles = getHandlePositions(element);
-  return handles.find((h) => h.type === handleType) || null;
+  return { type: handleType, x: 0, y: 0, cursor: cursorForHandle[handleType] };
 }
 
 // ─── SVG rendering ─────────────────────────────────────────────────────────
 
-/** Ensure the handles SVG group exists (lazy creation, above elements layer). */
+// Lazy creation, above elements layer
 export function ensureHandlesGroup(
   existing: SVGGElement | null,
   svg: SVGSVGElement | null,
@@ -161,9 +146,9 @@ export function ensureHandlesGroup(
 export interface RenderHandlesOptions {
   snapTarget: Point | null;
   activeHandle: HandleType | null;
+  bboxOverrides?: Map<string, BoundingBox>;
 }
 
-/** Render selection handles for the given elements into the SVG group. */
 export function renderHandles(
   group: SVGGElement,
   selectedElements: DrawingElement[],
@@ -173,10 +158,10 @@ export function renderHandles(
 
   if (selectedElements.length === 0) return;
 
-  // Single vs multi-selection handle computation
   let handles: Handle[];
   if (selectedElements.length === 1) {
-    handles = getHandlePositions(selectedElements[0]);
+    const override = options?.bboxOverrides?.get(selectedElements[0].id);
+    handles = getHandlePositions(selectedElements[0], override);
   } else {
     const groupBbox = getGroupBoundingBox(selectedElements);
     const { x: minX, y: minY, width, height } = groupBbox;
@@ -200,12 +185,11 @@ export function renderHandles(
 
   for (const handle of handles) {
     if (handle.type === "rotation") {
-      // Connector from rotation handle to element's (rotated) top center
       let topCenterX = handle.x;
       let topCenterY = handle.y + 3.5;
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
-        const bbox = getBoundingBox(el);
+        const bbox = options?.bboxOverrides?.get(el.id) ?? getBoundingBox(el);
         const elCx = bbox.x + bbox.width / 2;
         const elCy = bbox.y + bbox.height / 2;
         const rotatedTopCenter = rotatePoint(
@@ -238,7 +222,6 @@ export function renderHandles(
       circle.style.cursor = handle.cursor;
       group.appendChild(circle);
     } else if (handle.type === "midpoint") {
-      // Control arms from endpoints to control point
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
         if (isLine(el)) {
@@ -268,7 +251,6 @@ export function renderHandles(
       circle.style.cursor = handle.cursor;
       group.appendChild(circle);
     } else if (handle.type === "start" || handle.type === "end") {
-      // Green stroke if bound to a shape, blue otherwise
       let handleStroke = "#0066ff";
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
@@ -304,7 +286,6 @@ export function renderHandles(
     }
   }
 
-  // Snap indicator during endpoint handle dragging
   if (options?.snapTarget && (options.activeHandle === "start" || options.activeHandle === "end")) {
     group.appendChild(createSnapIndicator(options.snapTarget));
   }

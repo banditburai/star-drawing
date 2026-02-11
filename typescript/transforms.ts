@@ -1,9 +1,3 @@
-/**
- * Resize and rotation transform logic — pure functions extracted from controller.
- *
- * Every function takes explicit parameters (no class state).
- */
-
 import {
   getBoundingBox,
   getElementCenter,
@@ -19,9 +13,19 @@ import type {
   PathElement,
   Point,
   ResizeHandleType,
+  TextBoundsMap,
   TextElement,
 } from "./types.js";
 import { isLine, isPath, isShape, isText } from "./types.js";
+
+function remapPoints(points: Point[], oldBounds: BoundingBox, newBounds: BoundingBox): Point[] {
+  const sx = oldBounds.width > 0 ? newBounds.width / oldBounds.width : 1;
+  const sy = oldBounds.height > 0 ? newBounds.height / oldBounds.height : 1;
+  return points.map(p => ({
+    x: newBounds.x + (p.x - oldBounds.x) * sx,
+    y: newBounds.y + (p.y - oldBounds.y) * sy,
+  }));
+}
 
 // ─── Resize ────────────────────────────────────────────────────────────────
 
@@ -47,7 +51,7 @@ export interface ResizeOptions {
  * edge midpoint) ensures the pair always spans both axes, avoiding the
  * single-axis collapse that breaks the original midpoint algorithm.
  */
-export function getFixedCorner(
+function getFixedCorner(
   handleType: HandleType,
   bounds: BoundingBox,
 ): Point {
@@ -207,13 +211,17 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
   return { x, y, width, height };
 }
 
-/** Apply resize bounds to a single element. */
+/**
+ * Apply new bounds to an element, scaling text font size and remapping line/path points.
+ * Used for both single-element resize (interactive) and group resize (per-element).
+ * @param originalFontSize - Override for text base font size (interactive resize tracks this separately)
+ */
 export function applyResize(
   element: DrawingElement,
   newBounds: BoundingBox,
-  startBounds: BoundingBox | null,
-  originalElement: DrawingElement | null,
-  originalFontSize: number | null,
+  startBounds: BoundingBox,
+  originalElement: DrawingElement,
+  originalFontSize?: number,
 ): void {
   if (isShape(element)) {
     element.x = newBounds.x;
@@ -221,11 +229,10 @@ export function applyResize(
     element.width = newBounds.width;
     element.height = newBounds.height;
   } else if (isText(element)) {
-    if (!startBounds) return;
-    const baseFontSize = originalFontSize ?? element.font_size;
+    const baseFontSize = originalFontSize ?? (originalElement as TextElement).font_size;
     const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
     const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-    const scale = Math.max(scaleX, scaleY);
+    const scale = Math.sqrt(scaleX * scaleY);
     element.font_size = Math.max(0.5, baseFontSize * scale);
     element.y = newBounds.y;
     if (element.text_align === "center") {
@@ -236,77 +243,12 @@ export function applyResize(
       element.x = newBounds.x;
     }
   } else if (isLine(element)) {
-    if (!startBounds) return;
-    const origLine = originalElement as LineElement | null;
-    if (!origLine) return;
-    const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
-    const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-    element.points = origLine.points.map((p) => ({
-      x: newBounds.x + (p.x - startBounds.x) * scaleX,
-      y: newBounds.y + (p.y - startBounds.y) * scaleY,
-    })) as [Point, Point];
+    element.points = remapPoints((originalElement as LineElement).points, startBounds, newBounds) as [Point, Point];
   } else if (isPath(element)) {
-    if (!startBounds) return;
-    const origPath = originalElement as PathElement | null;
-    if (!origPath) return;
-    const scaleX = startBounds.width > 0 ? newBounds.width / startBounds.width : 1;
-    const scaleY = startBounds.height > 0 ? newBounds.height / startBounds.height : 1;
-    element.points = origPath.points.map((p) => ({
-      x: newBounds.x + (p.x - startBounds.x) * scaleX,
-      y: newBounds.y + (p.y - startBounds.y) * scaleY,
-    }));
+    element.points = remapPoints((originalElement as PathElement).points, startBounds, newBounds);
   }
 }
 
-/** Set element bounds during group resize. Uses original element from group state. */
-export function setElementBounds(
-  el: DrawingElement,
-  newBounds: BoundingBox,
-  originalBounds: BoundingBox,
-  groupState: GroupResizeState,
-): void {
-  if (isShape(el)) {
-    el.x = newBounds.x;
-    el.y = newBounds.y;
-    el.width = newBounds.width;
-    el.height = newBounds.height;
-  } else if (isText(el)) {
-    el.x = newBounds.x;
-    el.y = newBounds.y;
-    const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-    const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-    const scale = Math.max(scaleX, scaleY);
-    const originalItem = groupState.elements.find((item) => item.id === el.id);
-    if (originalItem) {
-      const origText = originalItem.originalElement as TextElement;
-      el.font_size = Math.max(0.5, origText.font_size * scale);
-    }
-  } else if (isLine(el)) {
-    const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-    const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-    const originalItem = groupState.elements.find((item) => item.id === el.id);
-    if (originalItem) {
-      const origLine = originalItem.originalElement as LineElement;
-      el.points = origLine.points.map((p) => ({
-        x: newBounds.x + (p.x - originalBounds.x) * scaleX,
-        y: newBounds.y + (p.y - originalBounds.y) * scaleY,
-      })) as [Point, Point];
-    }
-  } else if (isPath(el)) {
-    const scaleX = originalBounds.width > 0 ? newBounds.width / originalBounds.width : 1;
-    const scaleY = originalBounds.height > 0 ? newBounds.height / originalBounds.height : 1;
-    const originalItem = groupState.elements.find((item) => item.id === el.id);
-    if (originalItem) {
-      const origPath = originalItem.originalElement as PathElement;
-      el.points = origPath.points.map((p) => ({
-        x: newBounds.x + (p.x - originalBounds.x) * scaleX,
-        y: newBounds.y + (p.y - originalBounds.y) * scaleY,
-      }));
-    }
-  }
-}
-
-/** Scale all elements proportionally within a group resize operation. */
 export function applyGroupResize(
   newGroupBounds: BoundingBox,
   groupState: GroupResizeState,
@@ -330,20 +272,15 @@ export function applyGroupResize(
       height: item.bounds.height * scaleY,
     };
 
-    setElementBounds(el, newElementBounds, item.bounds, groupState);
+    applyResize(el, newElementBounds, item.bounds, item.originalElement);
   }
 }
 
 // ─── Rotation ──────────────────────────────────────────────────────────────
 
-/** Set element position by center point. */
-export function setElementPosition(el: DrawingElement, newPos: Point): void {
-  if (isShape(el)) {
-    const bbox = getBoundingBox(el);
-    el.x = newPos.x - bbox.width / 2;
-    el.y = newPos.y - bbox.height / 2;
-  } else if (isText(el)) {
-    const bbox = getBoundingBox(el);
+function setElementPosition(el: DrawingElement, newPos: Point, textBounds?: TextBoundsMap): void {
+  if (isShape(el) || isText(el)) {
+    const bbox = getBoundingBox(el, textBounds);
     el.x = newPos.x - bbox.width / 2;
     el.y = newPos.y - bbox.height / 2;
   } else if (isLine(el)) {
@@ -375,11 +312,11 @@ export function setElementPosition(el: DrawingElement, newPos: Point): void {
   }
 }
 
-/** Rotate all elements in a group around the group center. */
 export function applyGroupRotation(
   newAngle: number,
   groupState: GroupRotationState,
   elements: Map<string, DrawingElement>,
+  textBounds?: TextBoundsMap,
 ): void {
   const deltaAngle = newAngle - groupState.startAngle;
   const center = groupState.center;
@@ -388,7 +325,6 @@ export function applyGroupRotation(
     const el = elements.get(item.id);
     if (!el) continue;
 
-    // Lines/arrows: bake rotation into point positions (no rotation transform)
     if (isLine(el)) {
       const origLine = item.originalElement as LineElement;
       el.points = [
@@ -404,9 +340,8 @@ export function applyGroupRotation(
       el.points = origPath.points.map((p) => rotatePoint(p, center, deltaAngle));
       el.rotation = 0;
     } else {
-      // Shapes and text: use rotation property
       const newPos = rotatePoint(item.position, center, deltaAngle);
-      setElementPosition(el, newPos);
+      setElementPosition(el, newPos, textBounds);
       el.rotation = item.rotation + deltaAngle;
     }
   }
