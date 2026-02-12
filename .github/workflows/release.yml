@@ -1,0 +1,177 @@
+name: Release to PyPI and GitHub
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-validate:
+    name: Build and Validate Package
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Install dependencies
+      run: uv sync --all-extras
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
+    - name: Build JavaScript from TypeScript
+      run: |
+        bun install --frozen-lockfile
+        bun run build
+
+    - name: Validate JavaScript build outputs
+      run: |
+        echo "Validating JavaScript assets..."
+        path="src/star_drawing/static/drawing-canvas.js"
+        if [ ! -f "$path" ]; then
+          echo "Missing: $path"
+          exit 1
+        fi
+        size=$(stat -c%s "$path")
+        echo "drawing-canvas.js: $size bytes"
+        if [ "$size" -eq 0 ]; then
+          echo "Empty file: $path"
+          exit 1
+        fi
+        echo "JavaScript assets validated"
+
+    - name: Build Python package
+      run: uv build
+
+    - name: Validate pyproject.toml
+      run: |
+        pip install validate-pyproject
+        validate-pyproject pyproject.toml
+
+    - name: Validate package contents
+      run: |
+        echo "Package contents:"
+        python -m zipfile -l dist/*.whl | grep -E "\.(js|py)$" | head -30
+
+        if python -m zipfile -l dist/*.whl | grep -q "drawing-canvas.js"; then
+          echo "JavaScript assets included in package"
+        else
+          echo "JavaScript assets missing from package"
+          exit 1
+        fi
+
+        echo "Package validation complete"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+        retention-days: 7
+
+  publish-to-testpypi:
+    name: Publish to TestPyPI
+    needs: [build-and-validate]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: test-pypi
+      url: https://test.pypi.org/p/star-drawing
+    permissions:
+      id-token: write
+
+    steps:
+    - name: Download package distributions
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+
+    - name: Publish to TestPyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        print-hash: true
+
+  publish-to-pypi:
+    name: Publish to PyPI
+    needs: [build-and-validate]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/star-drawing
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+    - name: Download package distributions
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        print-hash: true
+
+  create-github-release:
+    name: Create GitHub Release
+    needs: [publish-to-pypi]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download package distributions
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+
+    - name: Determine release type
+      id: release-type
+      run: |
+        if [[ ${{ github.ref_name }} =~ -alpha|-beta|-rc ]]; then
+          echo "prerelease=true" >> $GITHUB_OUTPUT
+          echo "Pre-release detected: ${{ github.ref_name }}"
+        else
+          echo "prerelease=false" >> $GITHUB_OUTPUT
+          echo "Stable release detected: ${{ github.ref_name }}"
+        fi
+
+    - name: Create GitHub Release
+      run: |
+        gh release create ${{ github.ref_name }} \
+          --title "star-drawing ${{ github.ref_name }}" \
+          --generate-notes \
+          ${{ steps.release-type.outputs.prerelease == 'true' && '--prerelease' || '--latest' }} \
+          dist/*
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

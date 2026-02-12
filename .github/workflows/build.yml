@@ -1,0 +1,59 @@
+name: Validate TypeScript & Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'typescript/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Install dependencies
+      run: uv sync --all-extras
+
+    - name: Lint with ruff
+      run: |
+        uv run ruff check src/ examples/
+        uv run ruff format --check src/ examples/
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
+    - name: Build JavaScript from TypeScript
+      run: |
+        bun install --frozen-lockfile
+        bun run build
+
+    - name: Verify build outputs
+      run: |
+        path="src/star_drawing/static/drawing-canvas.js"
+        test -f "$path" || { echo "Missing: $path"; exit 1; }
+        size=$(stat -c%s "$path")
+        test "$size" -gt 0 || { echo "Empty: $path"; exit 1; }
+        echo "drawing-canvas.js: $size bytes"
+
+    - name: Run tests
+      run: uv run pytest tests/ -v --tb=short -m "not slow"
+
+    - name: Test package build
+      run: |
+        uv build
+        python -m zipfile -l dist/*.whl | grep -q "drawing-canvas.js" || { echo "JS missing from wheel"; exit 1; }
+        echo "Package build verified"

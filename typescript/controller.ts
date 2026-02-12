@@ -1,4 +1,4 @@
-import { DASH_PRESETS, DEFAULT_CONFIG, SNAP_THRESHOLD, TOOL_DEFAULTS, fontFamilyMap, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
+import { BLUR_COMMIT_DELAY_MS, DASH_PRESETS, DEFAULT_CONFIG, DOUBLE_CLICK_MS, DUPLICATE_OFFSET_VB, MIN_POINT_DISTANCE_VB, MIN_TEXT_WIDTH_VB, MIN_TEXTAREA_WIDTH_PX, NUDGE_STEP, NUDGE_STEP_SHIFT, PREVIEW_OPACITY, ROTATION_SNAP_DEG, SNAP_THRESHOLD, TEXT_LINE_HEIGHT, TEXT_MARGIN_VB, TOOL_DEFAULTS, fontFamilyMap, fontSizeMap, reverseFontSizeMap, toolCursorMap } from "./constants.js";
 import {
   cloneElement,
   findSnapPoint,
@@ -35,6 +35,7 @@ import type {
   DrawingConfig,
   DrawingElement,
   DrawingState,
+  ElementChangeEvent,
   GroupResizeState,
   GroupRotationState,
   HandleType,
@@ -89,6 +90,7 @@ interface RotationSession {
 
 export interface DrawingCallbacks {
   onStateChange(patch: Partial<DrawingState>): void;
+  onElementChange?(changes: ElementChangeEvent[]): void;
 }
 
 const HIT_TOLERANCE_PX = 8;
@@ -190,7 +192,7 @@ class DrawingController {
     this.currentTool = this.config.defaultTool;
     this.callbacks.onStateChange(this.state);
     this.createSvgLayer();
-    this.bindEvents();
+    if (!this.config.readonly) this.bindEvents();
   }
 
   private createSvgLayer(): void {
@@ -235,7 +237,7 @@ class DrawingController {
 
   private updateCursor(): void {
     if (!this.svg) return;
-    this.svg.style.cursor = toolCursorMap[this.currentTool] || "default";
+    this.svg.style.cursor = toolCursorMap[this.currentTool] ?? "default";
   }
 
   private handleKeyDown(e: KeyboardEvent): void {
@@ -262,7 +264,7 @@ class DrawingController {
 
     if (e.key.startsWith("Arrow") && this.selectedIds.size > 0) {
       e.preventDefault();
-      const step = e.shiftKey ? 5 : 1;
+      const step = e.shiftKey ? NUDGE_STEP_SHIFT : NUDGE_STEP;
       const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
       const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
       this.nudgeSelected(dx, dy);
@@ -282,7 +284,6 @@ class DrawingController {
     }
     if (e.altKey) return;
 
-    // Single-key tool shortcuts
     const toolMap: Record<string, Tool> = {
       v: "select",
       p: "pen",
@@ -304,176 +305,163 @@ class DrawingController {
   }
 
   private handlePointerDown(e: PointerEvent): void {
-    if (this.textEdit && this.textEdit.commitFn) {
+    if (this.textEdit?.commitFn) {
       this.textEdit.commitFn();
       return;
     }
 
     this.updateSvgRect();
-
     const tool = this.currentTool;
     const point = this.pointerToSvgCoords(e);
 
-    if (tool !== "select") {
-      this.updateCursor();
-    }
+    if (tool !== "select") this.updateCursor();
 
-    if (tool === "select" && this.selectedIds.size > 0) {
+    if (tool === "select") {
+      this.handleSelectDown(e, point);
+    } else if (tool === "pen" || tool === "highlighter") {
+      e.preventDefault();
+      this.svg?.setPointerCapture(e.pointerId);
+      this.startDrawing(point);
+    } else if (tool === "line" || tool === "arrow") {
+      e.preventDefault();
+      this.svg?.setPointerCapture(e.pointerId);
+      this.startLineTool(point);
+    } else if (tool === "rect" || tool === "ellipse" || tool === "diamond") {
+      e.preventDefault();
+      this.svg?.setPointerCapture(e.pointerId);
+      this.startShapeTool(point);
+    } else if (tool === "eraser") {
+      e.preventDefault();
+      this.svg?.setPointerCapture(e.pointerId);
+      this.isErasing = true;
+      this.eraseAtPoint(point);
+    } else if (tool === "text") {
+      e.preventDefault();
+      this.startTextEditing(point);
+    }
+  }
+
+  private handleSelectDown(e: PointerEvent, point: Point): void {
+    // Handle hit-test for resize/rotate on existing selection
+    if (this.selectedIds.size > 0) {
       const handle = hitTestHandle(e.clientX, e.clientY, this.selectedIds);
       if (handle) {
         e.preventDefault();
         this.svg?.setPointerCapture(e.pointerId);
         this.activeHandle = handle.type;
-
-        if (this.selectedIds.size > 1) {
-          const selectedElements = this.getSelectedElements();
-
-          if (handle.type === "rotation") {
-            const groupBounds = getGroupBoundingBox(selectedElements, this.textBoundsCache);
-            const groupCenter: Point = {
-              x: groupBounds.x + groupBounds.width / 2,
-              y: groupBounds.y + groupBounds.height / 2,
-            };
-            const startAngle = getAngleFromPoint(point, groupCenter);
-            this.rotating = {
-              startAngle,
-              elementId: null,
-              elementStartRotation: 0,
-              originalElement: null,
-              group: {
-                elements: selectedElements.map((el) => ({
-                  id: el.id,
-                  position: getElementCenter(el, this.textBoundsCache),
-                  rotation: el.rotation,
-                  originalElement: cloneElement(el),
-                })),
-                center: groupCenter,
-                startAngle,
-              },
-            };
-          } else {
-            const groupBounds = getGroupBoundingBox(selectedElements, this.textBoundsCache);
-            this.resizing = {
-              startBounds: groupBounds,
-              startPoint: point,
-              elementId: null,
-              originalElement: null,
-              originalFontSize: null,
-              group: {
-                elements: selectedElements.map((el) => ({
-                  id: el.id,
-                  bounds: getBoundingBox(el, this.textBoundsCache),
-                  rotation: el.rotation,
-                  originalElement: cloneElement(el),
-                })),
-                groupBounds,
-              },
-            };
-          }
-        } else {
-          const [selectedId] = this.selectedIds;
-          const element = this.elements.get(selectedId);
-          if (element) {
-            if (handle.type === "rotation") {
-              const center = getElementCenter(element, this.textBoundsCache);
-              this.rotating = {
-                startAngle: getAngleFromPoint(point, center),
-                elementId: selectedId,
-                elementStartRotation: element.rotation,
-                originalElement: cloneElement(element),
-                group: null,
-              };
-            } else {
-              this.resizing = {
-                startBounds: getBoundingBox(element, this.textBoundsCache),
-                startPoint: point,
-                elementId: selectedId,
-                originalElement: cloneElement(element),
-                originalFontSize: null,
-                group: null,
-              };
-            }
-          }
-        }
+        this.initTransformSession(handle.type, point);
         return;
       }
     }
 
-    if (tool === "pen" || tool === "highlighter") {
-      e.preventDefault();
-      this.svg?.setPointerCapture(e.pointerId);
-      this.startDrawing(point);
-      return;
-    }
+    e.preventDefault();
+    const hitTolerance = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const now = Date.now();
 
-    if (tool === "line" || tool === "arrow") {
-      e.preventDefault();
-      this.svg?.setPointerCapture(e.pointerId);
-      this.startLineTool(point);
-      return;
-    }
-
-    if (tool === "rect" || tool === "ellipse" || tool === "diamond") {
-      e.preventDefault();
-      this.svg?.setPointerCapture(e.pointerId);
-      this.startShapeTool(point);
-      return;
-    }
-
-    if (tool === "eraser") {
-      e.preventDefault();
-      this.svg?.setPointerCapture(e.pointerId);
-      this.isErasing = true;
-      this.eraseAtPoint(point);
-      return;
-    }
-
-    if (tool === "select") {
-      e.preventDefault();
-      const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
-      const now = Date.now();
-
-      // Double-click to edit text: check BEFORE cycling. Uses hitTestElement on
-      // lastClickId so it works on cycled-to text (not just topmost).
-      if (this.lastClickId && now - this.lastClickTime < 400) {
-        const el = this.elements.get(this.lastClickId);
-        if (el && isText(el) && hitTestElement(point.x, point.y, el, tol, this.textBoundsCache)) {
-          this.startTextEditing({ x: el.x, y: el.y }, el);
-          this.lastClickTime = 0;
-          this.lastClickId = null;
-          return;
-        }
-      }
-
-      const cycleEl = e.shiftKey ? null : this.getClickCycleElement(point);
-      const clickedId = cycleEl?.id ?? getTopmostElementAtPoint(point.x, point.y, this.elements, tol, this.textBoundsCache);
-
-      this.lastClickTime = now;
-      this.lastClickId = clickedId;
-
-      if (clickedId && this.selectedIds.has(clickedId)) {
-        this.svg?.setPointerCapture(e.pointerId);
-        this.startDragging(point);
+    // Double-click to edit text: check BEFORE cycling. Uses hitTestElement on
+    // lastClickId so it works on cycled-to text (not just topmost).
+    if (this.lastClickId && now - this.lastClickTime < DOUBLE_CLICK_MS) {
+      const el = this.elements.get(this.lastClickId);
+      if (el && isText(el) && hitTestElement(point.x, point.y, el, hitTolerance, this.textBoundsCache)) {
+        this.startTextEditing({ x: el.x, y: el.y }, el);
+        this.lastClickTime = 0;
+        this.lastClickId = null;
         return;
       }
+    }
 
-      if (clickedId) {
-        this.selectElement(clickedId, e.shiftKey);
+    const cycleEl = e.shiftKey ? null : this.getClickCycleElement(point);
+    const clickedId = cycleEl?.id ?? getTopmostElementAtPoint(point.x, point.y, this.elements, hitTolerance, this.textBoundsCache);
+
+    this.lastClickTime = now;
+    this.lastClickId = clickedId;
+
+    if (clickedId && this.selectedIds.has(clickedId)) {
+      this.svg?.setPointerCapture(e.pointerId);
+      this.startDragging(point);
+      return;
+    }
+
+    if (clickedId) {
+      this.selectElement(clickedId, e.shiftKey);
+    } else {
+      if (!e.shiftKey) this.deselectAll();
+    }
+
+    if (clickedId && this.selectedIds.has(clickedId)) {
+      this.svg?.setPointerCapture(e.pointerId);
+      this.startDragging(point);
+    }
+  }
+
+  private initTransformSession(handleType: HandleType, point: Point): void {
+    if (this.selectedIds.size > 1) {
+      const selectedElements = this.getSelectedElements();
+      if (handleType === "rotation") {
+        const groupBounds = getGroupBoundingBox(selectedElements, this.textBoundsCache);
+        const groupCenter: Point = {
+          x: groupBounds.x + groupBounds.width / 2,
+          y: groupBounds.y + groupBounds.height / 2,
+        };
+        const startAngle = getAngleFromPoint(point, groupCenter);
+        this.rotating = {
+          startAngle,
+          elementId: null,
+          elementStartRotation: 0,
+          originalElement: null,
+          group: {
+            elements: selectedElements.map((el) => ({
+              id: el.id,
+              position: getElementCenter(el, this.textBoundsCache),
+              rotation: el.rotation,
+              originalElement: cloneElement(el),
+            })),
+            center: groupCenter,
+            startAngle,
+          },
+        };
       } else {
-        if (!e.shiftKey) this.deselectAll();
+        const groupBounds = getGroupBoundingBox(selectedElements, this.textBoundsCache);
+        this.resizing = {
+          startBounds: groupBounds,
+          startPoint: point,
+          elementId: null,
+          originalElement: null,
+          originalFontSize: null,
+          group: {
+            elements: selectedElements.map((el) => ({
+              id: el.id,
+              bounds: getBoundingBox(el, this.textBoundsCache),
+              rotation: el.rotation,
+              originalElement: cloneElement(el),
+            })),
+            groupBounds,
+          },
+        };
       }
-
-      if (clickedId && this.selectedIds.has(clickedId)) {
-        this.svg?.setPointerCapture(e.pointerId);
-        this.startDragging(point);
+    } else {
+      const [selectedId] = this.selectedIds;
+      const element = this.elements.get(selectedId);
+      if (!element) return;
+      if (handleType === "rotation") {
+        const center = getElementCenter(element, this.textBoundsCache);
+        this.rotating = {
+          startAngle: getAngleFromPoint(point, center),
+          elementId: selectedId,
+          elementStartRotation: element.rotation,
+          originalElement: cloneElement(element),
+          group: null,
+        };
+      } else {
+        this.resizing = {
+          startBounds: getBoundingBox(element, this.textBoundsCache),
+          startPoint: point,
+          elementId: selectedId,
+          originalElement: cloneElement(element),
+          originalFontSize: null,
+          group: null,
+        };
       }
-      return;
-    }
-
-    if (tool === "text") {
-      e.preventDefault();
-      this.startTextEditing(point);
-      return;
     }
   }
 
@@ -484,27 +472,24 @@ class DrawingController {
     if (!rect) return;
 
     const isEditing = !!existingElement;
-    const fm = isEditing ? existingElement.font_family : this.state.font_family;
-    const rawFs = isEditing ? existingElement.font_size : this.state.font_size;
-    const fs = this.resolveFontSize(rawFs);
-    const ta = isEditing ? existingElement.text_align : this.state.text_align;
+    const fontFamily = isEditing ? existingElement.font_family : this.state.font_family;
+    const fontSize = this.resolveFontSize(isEditing ? existingElement.font_size : this.state.font_size);
+    const textAlign = isEditing ? existingElement.text_align : this.state.text_align;
     const color = isEditing ? existingElement.stroke_color : this.state.stroke_color;
 
     const pos = this.svgToContainerPx(svgPoint.x, svgPoint.y);
-    const fontSizePx = this.svgUnitsToPx(fs, "y");
+    const fontSizePx = this.svgUnitsToPx(fontSize, "y");
 
-    // Max-width for text wrapping. Uses "y" axis because the textarea has
-    // scaleX(rect.width/rect.height) — its CSS px map to viewBox units via rect.height.
-    const existingWidth = existingElement?.width;
-    const availableVB = existingWidth ?? (
-      ta === "center" ? 2 * Math.min(svgPoint.x, 100 - svgPoint.x) - 4
-      : ta === "right" ? svgPoint.x - 2
-      : 98 - svgPoint.x
+    // Max-width uses "y" axis because the textarea has scaleX(rect.width/rect.height)
+    const availableVB = existingElement?.width ?? (
+      textAlign === "center" ? 2 * Math.min(svgPoint.x, 100 - svgPoint.x) - TEXT_MARGIN_VB * 2
+      : textAlign === "right" ? svgPoint.x - TEXT_MARGIN_VB
+      : 100 - TEXT_MARGIN_VB - svgPoint.x
     );
-    const maxWidthVB = Math.max(10, availableVB);
+    const maxWidthVB = Math.max(MIN_TEXT_WIDTH_VB, availableVB);
     const maxWidthPx = this.svgUnitsToPx(maxWidthVB, "y");
 
-    const textarea = this.createTextOverlay(pos, fontSizePx, rect.width / rect.height, fm, ta, color, existingElement?.text, maxWidthPx);
+    const textarea = this.createTextOverlay(pos, fontSizePx, rect.width / rect.height, fontFamily, textAlign, color, existingElement?.text, maxWidthPx);
 
     const state: TextEditState = {
       overlay: textarea,
@@ -530,7 +515,7 @@ class DrawingController {
 
     textarea.addEventListener("input", () => this.autoResizeTextarea(textarea));
     textarea.addEventListener("blur", () => {
-      state.blurTimeout = setTimeout(commit, 100);
+      state.blurTimeout = setTimeout(commit, BLUR_COMMIT_DELAY_MS);
     });
     textarea.addEventListener("keydown", (e: KeyboardEvent) => {
       e.stopPropagation();
@@ -546,7 +531,7 @@ class DrawingController {
       }
     });
 
-    if (isEditing && existingElement) {
+    if (isEditing) {
       this.elementsGroup?.querySelector(`#${existingElement.id}`)?.setAttribute("display", "none");
     }
 
@@ -583,20 +568,16 @@ class DrawingController {
         this.rerenderElements();
       }
     } else {
-      const fm = this.state.font_family;
-      const rawFs = this.state.font_size;
-      const fs = this.resolveFontSize(rawFs);
-      const ta = this.state.text_align;
-      const color = this.state.stroke_color;
-      const opacity = this.state.opacity;
-      const layer = this.state.active_layer;
-      const needsWrap = this.textNeedsWrapping(text, maxWidthVB, fs, fm);
+      const { font_family: fontFamily, font_size: rawFontSize, text_align: textAlign,
+        stroke_color, opacity, active_layer: layer } = this.state;
+      const fontSize = this.resolveFontSize(rawFontSize);
+      const needsWrap = this.textNeedsWrapping(text, maxWidthVB, fontSize, fontFamily);
 
       const textElement: TextElement = {
         id: `text-${crypto.randomUUID().split("-")[0]}`,
         type: "text",
         layer,
-        stroke_color: color,
+        stroke_color,
         stroke_width: 0,
         dash_length: 0,
         dash_gap: 0,
@@ -607,9 +588,9 @@ class DrawingController {
         x: svgPoint.x,
         y: svgPoint.y,
         text,
-        font_size: fs,
-        font_family: fm,
-        text_align: ta,
+        font_size: fontSize,
+        font_family: fontFamily,
+        text_align: textAlign,
         width: needsWrap ? maxWidthVB : undefined,
       };
 
@@ -627,7 +608,7 @@ class DrawingController {
   }
 
   private resolveFontSize(raw: string | number): number {
-    return typeof raw === "string" ? (fontSizeMap[raw] ?? 4) : raw;
+    return typeof raw === "string" ? (fontSizeMap[raw] ?? fontSizeMap.medium) : raw;
   }
 
   private computeTextTransform(textAlign: string, stretchX: number): string {
@@ -654,11 +635,11 @@ class DrawingController {
       left: `${pos.left}px`,
       top: `${pos.top}px`,
       fontSize: `${fontSizePx}px`,
-      fontFamily: fontFamilyMap[fontFamily] || fontFamilyMap.normal,
+      fontFamily: fontFamilyMap[fontFamily] ?? fontFamilyMap.normal,
       textAlign,
       color,
       minWidth: "20px",
-      minHeight: `${fontSizePx * 1.4}px`,
+      minHeight: `${fontSizePx * TEXT_LINE_HEIGHT}px`,
       transformOrigin: "0 0",
       transform: this.computeTextTransform(textAlign, stretchX),
     });
@@ -679,7 +660,7 @@ class DrawingController {
     textarea.style.width = "auto";
     const naturalWidth = textarea.scrollWidth + 2;
     textarea.style.whiteSpace = savedWS;
-    textarea.style.width = `${Math.min(Math.max(40, naturalWidth), maxW)}px`;
+    textarea.style.width = `${Math.min(Math.max(MIN_TEXTAREA_WIDTH_PX, naturalWidth), maxW)}px`;
     textarea.style.height = "auto";
     textarea.style.height = `${textarea.scrollHeight}px`;
   }
@@ -712,10 +693,10 @@ class DrawingController {
       left: `${pos.left}px`,
       top: `${pos.top}px`,
       fontSize: `${fontSizePx}px`,
-      fontFamily: fontFamilyMap[el.font_family] || fontFamilyMap.normal,
+      fontFamily: fontFamilyMap[el.font_family] ?? fontFamilyMap.normal,
       textAlign: el.text_align,
       color: el.stroke_color,
-      minHeight: `${fontSizePx * 1.4}px`,
+      minHeight: `${fontSizePx * TEXT_LINE_HEIGHT}px`,
       transform: transformCss,
     });
     this.textEdit.svgPoint = { x: el.x, y: el.y };
@@ -819,32 +800,11 @@ class DrawingController {
     const moveData: Array<{ id: string; before: MovePosition; after: MovePosition }> = [];
     for (const [id, startPos] of this.dragStartPositions) {
       const el = this.elements.get(id);
-      if (!el || !startPos) continue;
-
-      if ((isShape(el) || isText(el)) && !startPos.points) {
-        moveData.push({
-          id,
-          before: { x: startPos.x, y: startPos.y },
-          after: { x: el.x, y: el.y },
-        });
-      } else if (isLine(el) && startPos.points) {
-        moveData.push({
-          id,
-          before: { points: startPos.points, midpoint: startPos.midpoint },
-          after: {
-            points: el.points.map((p) => ({ ...p })),
-            midpoint: el.midpoint ? { ...el.midpoint } : undefined,
-          },
-        });
-      } else if (isPath(el) && startPos.points) {
-        moveData.push({
-          id,
-          before: { points: startPos.points },
-          after: {
-            points: el.points.map((p) => ({ ...p })),
-          },
-        });
-      }
+      if (!el) continue;
+      const before: MovePosition = startPos.points
+        ? { points: startPos.points, midpoint: startPos.midpoint }
+        : { x: startPos.x, y: startPos.y };
+      moveData.push({ id, before, after: this.captureElementPosition(el) });
     }
 
     if (moveData.length > 0) {
@@ -885,25 +845,18 @@ class DrawingController {
   }
 
   private eraseAtPoint(svgPoint: Point): void {
-    const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
-    const id = getTopmostElementAtPoint(svgPoint.x, svgPoint.y, this.elements, tol, this.textBoundsCache);
+    const hitTolerance = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const id = getTopmostElementAtPoint(svgPoint.x, svgPoint.y, this.elements, hitTolerance, this.textBoundsCache);
     if (!id) return;
 
     const element = this.elements.get(id);
     if (!element) return;
     this.elements.delete(id);
     this.elementsGroup?.querySelector(`#${id}`)?.remove();
-
-    for (const [, el] of this.elements) {
-      if (isLine(el)) {
-        if (el.startBinding?.elementId === id) el.startBinding = undefined;
-        if (el.endBinding?.elementId === id) el.endBinding = undefined;
-      }
-    }
+    this.clearBindingsTo(new Set([id]));
 
     if (this.selectedIds.delete(id)) {
-      this.setState({ selected_ids: [...this.selectedIds] });
-      this.updateSelectionVisual();
+      this.syncSelectionState();
     }
 
     this.pushUndo({ action: "remove", data: element });
@@ -911,35 +864,28 @@ class DrawingController {
 
   private startLineTool(point: Point): void {
     const tool = this.currentTool;
-    const strokeColor = this.state.stroke_color;
-    const strokeWidth = this.state.stroke_width;
-    const dashLength = this.state.dash_length || 0;
-    const dashGap = this.state.dash_gap || 0;
-    const opacity = this.state.opacity;
-    const layer = this.state.active_layer;
-    const startArrowhead = this.state.start_arrowhead || "none";
-    const endArrowhead = this.state.end_arrowhead || (tool === "arrow" ? "arrow" : "none");
+    const { stroke_color, stroke_width, opacity, active_layer: layer,
+      dash_length, dash_gap, start_arrowhead, end_arrowhead } = this.state;
 
     const snapResult = findSnapPoint(point, this.elements, SNAP_THRESHOLD);
-    const startPoint = snapResult ? snapResult.point : point;
-    this.snapTarget = snapResult ? snapResult.point : null;
-    this.lastSnapResult = snapResult;
+    const startPoint = snapResult?.point ?? point;
+    this.setSnapResult(snapResult);
 
     const element: LineElement = {
       id: `${tool}-${crypto.randomUUID().split("-")[0]}`,
       type: tool as "line" | "arrow",
       layer,
-      stroke_color: strokeColor,
-      stroke_width: strokeWidth,
-      dash_length: dashLength,
-      dash_gap: dashGap,
+      stroke_color,
+      stroke_width,
+      dash_length: dash_length ?? 0,
+      dash_gap: dash_gap ?? 0,
       fill_color: "",
       opacity,
       created_at: Date.now(),
       rotation: 0,
       points: [startPoint, startPoint],
-      start_arrowhead: startArrowhead,
-      end_arrowhead: endArrowhead,
+      start_arrowhead: start_arrowhead ?? "none",
+      end_arrowhead: end_arrowhead ?? (tool === "arrow" ? "arrow" : "none"),
       startBinding: snapResult?.elementId ? { elementId: snapResult.elementId, anchor: snapResult.anchor! } : undefined,
     };
     this.drawing = { element, points: [], anchor: null };
@@ -950,24 +896,18 @@ class DrawingController {
 
   private startShapeTool(point: Point): void {
     const tool = this.currentTool;
-    const strokeColor = this.state.stroke_color;
-    const strokeWidth = this.state.stroke_width;
-    const dashLength = this.state.dash_length || 0;
-    const dashGap = this.state.dash_gap || 0;
-    const fillColor = this.state.fill_color;
-    const fillEnabled = this.state.fill_enabled;
-    const opacity = this.state.opacity;
-    const layer = this.state.active_layer;
+    const { stroke_color, stroke_width, dash_length, dash_gap,
+      fill_color, fill_enabled, opacity, active_layer: layer } = this.state;
 
     const element: ShapeElement = {
       id: `${tool}-${crypto.randomUUID().split("-")[0]}`,
       type: tool as "rect" | "ellipse" | "diamond",
       layer,
-      stroke_color: strokeColor,
-      stroke_width: strokeWidth,
-      dash_length: dashLength,
-      dash_gap: dashGap,
-      fill_color: fillEnabled ? fillColor : "",
+      stroke_color,
+      stroke_width,
+      dash_length: dash_length ?? 0,
+      dash_gap: dash_gap ?? 0,
+      fill_color: fill_enabled ? fill_color : "",
       opacity,
       created_at: Date.now(),
       rotation: 0,
@@ -985,54 +925,16 @@ class DrawingController {
   private handlePointerMove(e: PointerEvent): void {
     const point = this.pointerToSvgCoords(e);
 
-    if (this.isDragging) {
-      this.moveDragging(point);
-      return;
-    }
+    if (this.isDragging) { this.moveDragging(point); return; }
+    if (this.drawing) { this.moveDrawing(point); return; }
+    if (this.isErasing) { this.eraseAtPoint(point); return; }
+    if (this.activeHandle) { this.moveActiveHandle(point, e); return; }
+    this.updateHoverCursor(point);
+  }
 
-    if (this.drawing) {
-      this.moveDrawing(point);
-      return;
-    }
-
-    if (this.isErasing) {
-      this.eraseAtPoint(point);
-      return;
-    }
-
+  private moveActiveHandle(point: Point, e: PointerEvent): void {
     if (this.activeHandle === "rotation" && this.rotating) {
-      if (this.rotating.group) {
-        const group = this.rotating.group;
-        const center = group.center;
-        let currentAngle = getAngleFromPoint(point, center);
-
-        if (e.shiftKey) {
-          const deltaAngle = currentAngle - group.startAngle;
-          const snappedDelta = Math.round(deltaAngle / 15) * 15;
-          currentAngle = group.startAngle + snappedDelta;
-        }
-
-        applyGroupRotation(currentAngle, group, this.elements, this.textBoundsCache);
-        const groupIds = new Set(group.elements.map(item => item.id));
-        this.updateBoundArrows(groupIds);
-        this.rerenderElementSet(groupIds);
-      } else if (this.rotating.elementId) {
-        const element = this.elements.get(this.rotating.elementId);
-        if (element) {
-          const center = getElementCenter(element, this.textBoundsCache);
-          const currentAngle = getAngleFromPoint(point, center);
-          let newRotation = this.rotating.elementStartRotation + (currentAngle - this.rotating.startAngle);
-
-          if (e.shiftKey) {
-            newRotation = Math.round(newRotation / 15) * 15;
-          }
-
-          element.rotation = newRotation;
-          const ids = new Set([this.rotating.elementId]);
-          this.updateBoundArrows(ids);
-          this.rerenderElementSet(ids);
-        }
-      }
+      this.moveRotationHandle(point, e);
       return;
     }
 
@@ -1042,96 +944,134 @@ class DrawingController {
         this.activeHandle === "midpoint") &&
       this.resizing?.elementId
     ) {
-      const element = this.elements.get(this.resizing.elementId);
-      if (element && isLine(element)) {
-        const dx = point.x - this.resizing.startPoint.x;
-        const dy = point.y - this.resizing.startPoint.y;
-        const origLine = this.resizing.originalElement as LineElement;
-
-        if (this.activeHandle === "start") {
-          const rawPoint = { x: origLine.points[0].x + dx, y: origLine.points[0].y + dy };
-          const snapResult = findSnapPoint(rawPoint, this.elements, SNAP_THRESHOLD, this.resizing!.elementId!);
-          this.snapTarget = snapResult ? snapResult.point : null;
-          this.lastSnapResult = snapResult;
-          element.points[0] = snapResult ? snapResult.point : rawPoint;
-          element.startBinding = snapResult?.elementId
-            ? { elementId: snapResult.elementId, anchor: snapResult.anchor! }
-            : undefined;
-        } else if (this.activeHandle === "end") {
-          const rawPoint = { x: origLine.points[1].x + dx, y: origLine.points[1].y + dy };
-          const snapResult = findSnapPoint(rawPoint, this.elements, SNAP_THRESHOLD, this.resizing!.elementId!);
-          this.snapTarget = snapResult ? snapResult.point : null;
-          this.lastSnapResult = snapResult;
-          element.points[1] = snapResult ? snapResult.point : rawPoint;
-          element.endBinding = snapResult?.elementId
-            ? { elementId: snapResult.elementId, anchor: snapResult.anchor! }
-            : undefined;
-        } else if (this.activeHandle === "midpoint") {
-          const handleStart = getLineMidpointPosition(origLine);
-          element.midpoint = {
-            x: handleStart.x + dx,
-            y: handleStart.y + dy,
-          };
-        }
-        this.rerenderElementSet([this.resizing.elementId]);
-      }
+      this.moveLineHandle(point);
       return;
     }
 
     if (this.activeHandle && this.resizing) {
-      const rotation = this.resizing.elementId
-        ? (this.elements.get(this.resizing.elementId)?.rotation ?? 0)
-        : 0;
-
-      const dx = point.x - this.resizing.startPoint.x;
-      const dy = point.y - this.resizing.startPoint.y;
-      const element = this.resizing.elementId ? this.elements.get(this.resizing.elementId) : undefined;
-      const isTextEl = element ? isText(element) : false;
-
-      const isTextReflow = isTextEl && (this.activeHandle === "e" || this.activeHandle === "w");
-
-      const newBounds = calculateResizeBounds({
-        handleType: this.activeHandle as ResizeHandleType,
-        startBounds: this.resizing.startBounds,
-        dx, dy,
-        rotation,
-        maintainAspectRatio: isTextReflow ? false : (e.shiftKey || isTextEl),
-        resizeFromCenter: e.altKey,
-      });
-
-      if (this.resizing.group) {
-        applyGroupResize(newBounds, this.resizing.group, this.elements);
-        const groupIds = new Set(this.resizing.group.elements.map(item => item.id));
-        this.updateBoundArrows(groupIds);
-        this.rerenderElementSet(groupIds);
-      } else if (element && this.resizing.originalElement) {
-        if (isTextReflow) {
-          applyTextReflow(element as TextElement, newBounds);
-        } else {
-          if (isText(element) && this.resizing.originalFontSize === null) {
-            this.resizing.originalFontSize = element.font_size;
-          }
-          applyResize(element, newBounds, this.resizing.startBounds, this.resizing.originalElement, this.resizing.originalFontSize ?? undefined);
-        }
-        const ids = new Set([this.resizing.elementId!]);
-        this.updateBoundArrows(ids);
-        this.rerenderElementSet(ids);
-      }
-      return;
+      this.moveResizeHandle(point, e);
     }
+  }
 
-    const tool = this.currentTool;
-    if (tool === "select" && this.svg) {
-      const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
-      const hoveredId = getTopmostElementAtPoint(point.x, point.y, this.elements, tol, this.textBoundsCache);
+  private moveRotationHandle(point: Point, e: PointerEvent): void {
+    const session = this.rotating;
+    if (!session) return;
 
-      if (hoveredId && this.selectedIds.has(hoveredId)) {
-        this.svg.style.cursor = "move";
-      } else if (hoveredId) {
-        this.svg.style.cursor = "pointer";
-      } else {
-        this.svg.style.cursor = "default";
+    if (session.group) {
+      const group = session.group;
+      let currentAngle = getAngleFromPoint(point, group.center);
+
+      if (e.shiftKey) {
+        const deltaAngle = currentAngle - group.startAngle;
+        currentAngle = group.startAngle + Math.round(deltaAngle / ROTATION_SNAP_DEG) * ROTATION_SNAP_DEG;
       }
+
+      applyGroupRotation(currentAngle, group, this.elements, this.textBoundsCache);
+      const groupIds = new Set(group.elements.map(item => item.id));
+      this.updateBoundArrows(groupIds);
+      this.rerenderElementSet(groupIds);
+    } else if (session.elementId) {
+      const element = this.elements.get(session.elementId);
+      if (!element) return;
+
+      const center = getElementCenter(element, this.textBoundsCache);
+      const currentAngle = getAngleFromPoint(point, center);
+      let newRotation = session.elementStartRotation + (currentAngle - session.startAngle);
+
+      if (e.shiftKey) {
+        newRotation = Math.round(newRotation / ROTATION_SNAP_DEG) * ROTATION_SNAP_DEG;
+      }
+
+      element.rotation = newRotation;
+      const ids = new Set([session.elementId]);
+      this.updateBoundArrows(ids);
+      this.rerenderElementSet(ids);
+    }
+  }
+
+  private moveLineHandle(point: Point): void {
+    const session = this.resizing;
+    if (!session?.elementId) return;
+
+    const element = this.elements.get(session.elementId);
+    if (!element || !isLine(element)) return;
+
+    const dx = point.x - session.startPoint.x;
+    const dy = point.y - session.startPoint.y;
+    const origLine = session.originalElement as LineElement;
+
+    if (this.activeHandle === "start" || this.activeHandle === "end") {
+      const idx = this.activeHandle === "start" ? 0 : 1;
+      const bindingKey: "startBinding" | "endBinding" = this.activeHandle === "start" ? "startBinding" : "endBinding";
+      const rawPoint = { x: origLine.points[idx].x + dx, y: origLine.points[idx].y + dy };
+      const snapResult = findSnapPoint(rawPoint, this.elements, SNAP_THRESHOLD, session.elementId);
+      this.setSnapResult(snapResult);
+      element.points[idx] = snapResult?.point ?? rawPoint;
+      element[bindingKey] = snapResult?.elementId
+        ? { elementId: snapResult.elementId, anchor: snapResult.anchor! }
+        : undefined;
+    } else if (this.activeHandle === "midpoint") {
+      const handleStart = getLineMidpointPosition(origLine);
+      element.midpoint = { x: handleStart.x + dx, y: handleStart.y + dy };
+    }
+    this.rerenderElementSet([session.elementId]);
+  }
+
+  private moveResizeHandle(point: Point, e: PointerEvent): void {
+    const session = this.resizing;
+    if (!session) return;
+
+    const rotation = session.elementId
+      ? (this.elements.get(session.elementId)?.rotation ?? 0)
+      : 0;
+
+    const dx = point.x - session.startPoint.x;
+    const dy = point.y - session.startPoint.y;
+    const element = session.elementId ? this.elements.get(session.elementId) : undefined;
+    const isTextEl = element ? isText(element) : false;
+    const isTextReflow = isTextEl && (this.activeHandle === "e" || this.activeHandle === "w");
+
+    const newBounds = calculateResizeBounds({
+      handleType: this.activeHandle as ResizeHandleType,
+      startBounds: session.startBounds,
+      dx, dy,
+      rotation,
+      maintainAspectRatio: isTextReflow ? false : (e.shiftKey || isTextEl),
+      resizeFromCenter: e.altKey,
+    });
+
+    if (session.group) {
+      applyGroupResize(newBounds, session.group, this.elements);
+      const groupIds = new Set(session.group.elements.map(item => item.id));
+      this.updateBoundArrows(groupIds);
+      this.rerenderElementSet(groupIds);
+    } else if (element && session.originalElement) {
+      if (isTextReflow) {
+        applyTextReflow(element as TextElement, newBounds);
+      } else {
+        if (isText(element) && session.originalFontSize === null) {
+          session.originalFontSize = element.font_size;
+        }
+        applyResize(element, newBounds, session.startBounds, session.originalElement, session.originalFontSize ?? undefined);
+      }
+      const ids = new Set([session.elementId!]);
+      this.updateBoundArrows(ids);
+      this.rerenderElementSet(ids);
+    }
+  }
+
+  private updateHoverCursor(point: Point): void {
+    if (this.currentTool !== "select" || !this.svg) return;
+
+    const hitTolerance = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const hoveredId = getTopmostElementAtPoint(point.x, point.y, this.elements, hitTolerance, this.textBoundsCache);
+
+    if (hoveredId && this.selectedIds.has(hoveredId)) {
+      this.svg.style.cursor = "move";
+    } else if (hoveredId) {
+      this.svg.style.cursor = "pointer";
+    } else {
+      this.svg.style.cursor = "default";
     }
   }
 
@@ -1186,8 +1126,8 @@ class DrawingController {
   }
 
   private getClickCycleElement(svgPoint: Point): DrawingElement | null {
-    const tol = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
-    const sameSpot = tol * 0.5;
+    const hitTolerance = this.screenToViewBoxTolerance(HIT_TOLERANCE_PX);
+    const sameSpot = hitTolerance * 0.5;
 
     if (this.lastCyclePoint &&
         Math.abs(svgPoint.x - this.lastCyclePoint.x) < sameSpot &&
@@ -1197,7 +1137,7 @@ class DrawingController {
       return this.cycleStack[this.cycleIndex];
     }
 
-    this.cycleStack = getElementsAtPoint(svgPoint.x, svgPoint.y, this.elements, tol, this.textBoundsCache);
+    this.cycleStack = getElementsAtPoint(svgPoint.x, svgPoint.y, this.elements, hitTolerance, this.textBoundsCache);
     this.cycleIndex = 0;
     this.lastCyclePoint = svgPoint;
     return this.cycleStack[0] ?? null;
@@ -1217,7 +1157,7 @@ class DrawingController {
 
     const preview = this.renderElement(this.drawing.element);
     if (preview) {
-      preview.setAttribute("opacity", "0.6");
+      preview.setAttribute("opacity", String(PREVIEW_OPACITY));
       preview.style.pointerEvents = "none";
       this.previewGroup.appendChild(preview);
     }
@@ -1246,6 +1186,40 @@ class DrawingController {
     this.undoStack.push(action);
     this.redoStack = [];
     this.setState({ can_undo: true, can_redo: false });
+    this.emitChangesFromAction(action);
+  }
+
+  private emitChanges(changes: ElementChangeEvent[]): void {
+    if (changes.length > 0) this.callbacks.onElementChange?.(changes);
+  }
+
+  private emitChangesFromAction(action: UndoAction): void {
+    const changes: ElementChangeEvent[] = [];
+    switch (action.action) {
+      case "add":
+        changes.push({ type: "create", element: cloneElement(action.data) });
+        break;
+      case "remove":
+        changes.push({ type: "delete", elementId: action.data.id });
+        break;
+      case "remove_batch":
+        for (const el of action.data) {
+          changes.push({ type: "delete", elementId: el.id });
+        }
+        break;
+      case "move":
+        for (const item of action.data) {
+          const el = this.elements.get(item.id);
+          if (el) changes.push({ type: "update", element: cloneElement(el) });
+        }
+        break;
+      case "modify":
+        for (const item of action.data) {
+          changes.push({ type: "update", element: cloneElement(item.after) });
+        }
+        break;
+    }
+    this.emitChanges(changes);
   }
 
   private renderElement(el: DrawingElement): SVGElement | null {
@@ -1280,7 +1254,7 @@ class DrawingController {
     }
   }
 
-  private doRenderHandles(): void {
+  private renderHandles(): void {
     this.handlesGroup = ensureHandlesGroup(this.handlesGroup, this.svg);
     const selected = this.getSelectedElements();
     renderHandles(this.handlesGroup, selected, {
@@ -1396,6 +1370,43 @@ class DrawingController {
     }
   }
 
+  private captureElementPosition(el: DrawingElement): MovePosition {
+    if (isShape(el) || isText(el)) return { x: el.x, y: el.y };
+    if (isLine(el)) return { points: el.points.map(p => ({ ...p })), midpoint: el.midpoint ? { ...el.midpoint } : undefined };
+    return { points: (el as PathElement).points.map(p => ({ ...p })) };
+  }
+
+  private setSnapResult(result: SnapResult | null): void {
+    this.snapTarget = result?.point ?? null;
+    this.lastSnapResult = result;
+  }
+
+  private clearBindingsTo(deletedIds: Set<string>): void {
+    for (const [, el] of this.elements) {
+      if (!isLine(el)) continue;
+      if (el.startBinding && deletedIds.has(el.startBinding.elementId)) el.startBinding = undefined;
+      if (el.endBinding && deletedIds.has(el.endBinding.elementId)) el.endBinding = undefined;
+    }
+  }
+
+  private pushRemoveUndo(elements: DrawingElement[]): void {
+    if (elements.length === 1) {
+      this.pushUndo({ action: "remove", data: elements[0] });
+    } else if (elements.length > 1) {
+      this.pushUndo({ action: "remove_batch", data: elements });
+    }
+  }
+
+  private syncSelectionState(): void {
+    const { hasLine, hasText } = this.analyzeSelectionTypes();
+    this.setState({
+      selected_ids: [...this.selectedIds],
+      selected_is_line: hasLine,
+      selected_is_text: hasText,
+    });
+    this.updateSelectionVisual();
+  }
+
   destroy(): void {
     if (this.textEdit) {
       this.textEdit.overlay.remove();
@@ -1422,39 +1433,40 @@ class DrawingController {
 
   setTextProperty(property: "font_family" | "font_size" | "text_align", value: string): void {
     this.setState({ [property]: value });
-    const changed: TextElement[] = [];
+    const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (el && isText(el)) {
+        const before = cloneElement(el);
         if (property === "font_family") {
           el.font_family = value as TextElement["font_family"];
         } else if (property === "font_size") {
-          el.font_size = fontSizeMap[value] ?? (Number(value) || 4);
+          el.font_size = fontSizeMap[value] ?? (Number(value) || fontSizeMap.medium);
         } else if (property === "text_align") {
           const newAlign = value as TextElement["text_align"];
           const oldAlign = el.text_align;
           if (newAlign !== oldAlign) {
             const bbox = getBoundingBox(el, this.textBoundsCache);
             const visualCenterX = bbox.x + bbox.width / 2;
-            // Set x to the anchor point for the new alignment:
-            //   left (start) → x = visual left edge
-            //   center (middle) → x = visual center
-            //   right (end) → x = visual right edge
             if (newAlign === "left") el.x = bbox.x;
             else if (newAlign === "center") el.x = visualCenterX;
             else if (newAlign === "right") el.x = bbox.x + bbox.width;
           }
           el.text_align = newAlign;
         }
-        changed.push(el);
+        undoItems.push({ id, before, after: cloneElement(el) });
       }
     }
-    if (changed.length > 0) {
+    if (undoItems.length > 0) {
+      this.pushUndo({ action: "modify", data: undoItems });
       this.rerenderElements();
 
-      if (this.textEdit && this.textEdit.editingId) {
-        const editedEl = changed.find(t => t.id === this.textEdit!.editingId);
-        if (editedEl) this.updateTextOverlay(editedEl);
+      if (this.textEdit?.editingId) {
+        const editedEl = undoItems.find(t => t.id === this.textEdit!.editingId);
+        if (editedEl) {
+          const el = this.elements.get(editedEl.id);
+          if (el && isText(el)) this.updateTextOverlay(el);
+        }
       }
     }
   }
@@ -1463,52 +1475,39 @@ class DrawingController {
     const numericProps: Set<StyleProperty> = new Set(["stroke_width", "opacity", "dash_length", "dash_gap"]);
     const signalValue = numericProps.has(property) && typeof value === "string" ? Number(value) : value;
     this.setState({ [property]: signalValue });
-    const changed: DrawingElement[] = [];
+    const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el) continue;
 
+      if (property === "fill_color" && !isShape(el)) continue;
+      if ((property === "stroke_width" || property === "dash_length" || property === "dash_gap") && el.type === "text") continue;
+      if ((property === "start_arrowhead" || property === "end_arrowhead") && !isLine(el)) continue;
+
+      const before = cloneElement(el);
       switch (property) {
-        case "fill_color":
-          if (!isShape(el)) continue;
-          el.fill_color = value as string;
-          break;
-        case "stroke_color":
-          el.stroke_color = value as string;
-          break;
-        case "stroke_width":
-          if (el.type === "text") continue;
-          el.stroke_width = typeof value === "number" ? value : Number(value);
-          break;
-        case "opacity":
-          el.opacity = typeof value === "number" ? value : Number(value);
-          break;
-        case "dash_length":
-          if (el.type === "text") continue;
-          el.dash_length = typeof value === "number" ? value : Number(value);
-          break;
-        case "dash_gap":
-          if (el.type === "text") continue;
-          el.dash_gap = typeof value === "number" ? value : Number(value);
-          break;
-        case "start_arrowhead":
-          if (!isLine(el)) continue;
-          el.start_arrowhead = value as ArrowheadStyle;
-          break;
-        case "end_arrowhead":
-          if (!isLine(el)) continue;
-          el.end_arrowhead = value as ArrowheadStyle;
-          break;
+        case "fill_color": el.fill_color = value as string; break;
+        case "stroke_color": el.stroke_color = value as string; break;
+        case "stroke_width": el.stroke_width = typeof value === "number" ? value : Number(value); break;
+        case "opacity": el.opacity = typeof value === "number" ? value : Number(value); break;
+        case "dash_length": el.dash_length = typeof value === "number" ? value : Number(value); break;
+        case "dash_gap": el.dash_gap = typeof value === "number" ? value : Number(value); break;
+        case "start_arrowhead": (el as LineElement).start_arrowhead = value as ArrowheadStyle; break;
+        case "end_arrowhead": (el as LineElement).end_arrowhead = value as ArrowheadStyle; break;
       }
-      changed.push(el);
+      undoItems.push({ id, before, after: cloneElement(el) });
     }
 
-    if (changed.length > 0) {
+    if (undoItems.length > 0) {
+      this.pushUndo({ action: "modify", data: undoItems });
       this.rerenderElements();
 
-      if (this.textEdit && this.textEdit.editingId && property === "stroke_color") {
-        const editedEl = changed.find(e => e.id === this.textEdit!.editingId);
-        if (editedEl && isText(editedEl)) this.updateTextOverlay(editedEl);
+      if (this.textEdit?.editingId && property === "stroke_color") {
+        const editedEl = undoItems.find(e => e.id === this.textEdit!.editingId);
+        if (editedEl) {
+          const el = this.elements.get(editedEl.id);
+          if (el && isText(el)) this.updateTextOverlay(el);
+        }
       }
     }
   }
@@ -1517,15 +1516,19 @@ class DrawingController {
     const values = DASH_PRESETS[preset];
     if (!values) return;
     this.setState({ dash_length: values.dash_length, dash_gap: values.dash_gap });
-    let changed = false;
+    const undoItems: Array<{ id: string; before: DrawingElement; after: DrawingElement }> = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el || el.type === "text") continue;
+      const before = cloneElement(el);
       el.dash_length = values.dash_length;
       el.dash_gap = values.dash_gap;
-      changed = true;
+      undoItems.push({ id, before, after: cloneElement(el) });
     }
-    if (changed) this.rerenderElements();
+    if (undoItems.length > 0) {
+      this.pushUndo({ action: "modify", data: undoItems });
+      this.rerenderElements();
+    }
   }
 
   switchTool(newTool: Tool): void {
@@ -1545,22 +1548,22 @@ class DrawingController {
   private saveCurrentToolSettings(): void {
     const defaults = TOOL_DEFAULTS[this.currentTool];
     const settings: ToolSettings = {};
-    for (const [key, value] of Object.entries(defaults)) {
-      if (value !== undefined) {
-        (settings as Record<string, unknown>)[key] = this.state[key as keyof DrawingState];
+    for (const key of Object.keys(defaults) as (keyof ToolSettings)[]) {
+      if (defaults[key as keyof typeof defaults] !== undefined) {
+        settings[key] = this.state[key] as never;
       }
     }
     this.toolSettings.set(this.currentTool, settings);
   }
 
   private loadToolSettings(settings: ToolSettings): void {
-    const patch: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(settings)) {
-      if (value !== undefined) patch[key] = value;
+    const patch: Partial<DrawingState> = {};
+    for (const key of Object.keys(settings) as (keyof ToolSettings)[]) {
+      if (settings[key] !== undefined) {
+        (patch as Record<string, unknown>)[key] = settings[key];
+      }
     }
-    if (Object.keys(patch).length > 0) {
-      this.setState(patch as Partial<DrawingState>);
-    }
+    if (Object.keys(patch).length > 0) this.setState(patch);
   }
 
   addElement(el: DrawingElement): string {
@@ -1618,8 +1621,6 @@ class DrawingController {
 
   exportSvg(): string {
     if (!this.svg) return "";
-
-
     const clone = this.svg.cloneNode(true) as SVGSVGElement;
     const preview = clone.querySelector(".preview");
     const selectionOutlines = clone.querySelectorAll(".selection-outline");
@@ -1642,7 +1643,6 @@ class DrawingController {
     const svgEl = doc.querySelector("svg");
     if (!svgEl) return;
 
-
     this.elements.clear();
     this.selectedIds.clear();
     this.undoStack = [];
@@ -1650,77 +1650,55 @@ class DrawingController {
 
 
     const elementsGroup = svgEl.querySelector(".elements") || svgEl;
-    for (const el of elementsGroup.querySelectorAll("path, line, rect, ellipse, polygon, text")) {
-      const id = el.getAttribute("id") || `imported-${crypto.randomUUID().split("-")[0]}`;
-      const tagName = el.tagName.toLowerCase();
+    const num = (el: Element, attr: string, fallback = 0) =>
+      Number.parseFloat(el.getAttribute(attr) ?? String(fallback));
 
+    for (const el of elementsGroup.querySelectorAll("line, rect, ellipse, polygon, text")) {
+      const id = el.getAttribute("id") ?? `imported-${crypto.randomUUID().split("-")[0]}`;
+      const tagName = el.tagName.toLowerCase();
 
       const baseElement = {
         id,
         layer: "default" as Layer,
-        stroke_color: el.getAttribute("stroke") || "#000000",
-        stroke_width: Number.parseFloat(el.getAttribute("stroke-width") || "2"),
+        stroke_color: el.getAttribute("stroke") ?? DEFAULT_CONFIG.defaultStrokeColor,
+        stroke_width: num(el, "stroke-width", DEFAULT_CONFIG.defaultStrokeWidth),
         dash_length: 0,
         dash_gap: 0,
-        fill_color: el.getAttribute("fill") || "",
-        opacity: Number.parseFloat(el.getAttribute("opacity") || "1"),
+        fill_color: el.getAttribute("fill") ?? "",
+        opacity: num(el, "opacity", DEFAULT_CONFIG.defaultOpacity),
         created_at: Date.now(),
         rotation: 0,
       };
 
-      if (tagName === "path") {
+      if (tagName === "line") {
         this.elements.set(id, {
-          ...baseElement,
-          type: "pen",
-          points: [], // Path parsing would be complex, leave empty for now
-        } as PathElement);
-      } else if (tagName === "line") {
-        this.elements.set(id, {
-          ...baseElement,
-          type: "line",
+          ...baseElement, type: "line",
           points: [
-            {
-              x: Number.parseFloat(el.getAttribute("x1") || "0"),
-              y: Number.parseFloat(el.getAttribute("y1") || "0"),
-            },
-            {
-              x: Number.parseFloat(el.getAttribute("x2") || "0"),
-              y: Number.parseFloat(el.getAttribute("y2") || "0"),
-            },
+            { x: num(el, "x1"), y: num(el, "y1") },
+            { x: num(el, "x2"), y: num(el, "y2") },
           ],
           start_arrowhead: "none",
           end_arrowhead: "none",
         } as LineElement);
       } else if (tagName === "rect") {
         this.elements.set(id, {
-          ...baseElement,
-          type: "rect",
-          x: Number.parseFloat(el.getAttribute("x") || "0"),
-          y: Number.parseFloat(el.getAttribute("y") || "0"),
-          width: Number.parseFloat(el.getAttribute("width") || "0"),
-          height: Number.parseFloat(el.getAttribute("height") || "0"),
+          ...baseElement, type: "rect",
+          x: num(el, "x"), y: num(el, "y"),
+          width: num(el, "width"), height: num(el, "height"),
         } as ShapeElement);
       } else if (tagName === "ellipse") {
-        const cx = Number.parseFloat(el.getAttribute("cx") || "0");
-        const cy = Number.parseFloat(el.getAttribute("cy") || "0");
-        const rx = Number.parseFloat(el.getAttribute("rx") || "0");
-        const ry = Number.parseFloat(el.getAttribute("ry") || "0");
+        const cx = num(el, "cx"), cy = num(el, "cy");
+        const rx = num(el, "rx"), ry = num(el, "ry");
         this.elements.set(id, {
-          ...baseElement,
-          type: "ellipse",
-          x: cx - rx,
-          y: cy - ry,
-          width: rx * 2,
-          height: ry * 2,
+          ...baseElement, type: "ellipse",
+          x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2,
         } as ShapeElement);
       } else if (tagName === "text") {
         this.elements.set(id, {
-          ...baseElement,
-          type: "text",
-          x: Number.parseFloat(el.getAttribute("x") || "0"),
-          y: Number.parseFloat(el.getAttribute("y") || "0"),
-          text: el.textContent || "",
-          font_size: Number.parseFloat(el.getAttribute("font-size") || "4"),
+          ...baseElement, type: "text",
+          x: num(el, "x"), y: num(el, "y"),
+          text: el.textContent ?? "",
+          font_size: num(el, "font-size", fontSizeMap.medium),
           font_family: "normal",
           text_align: "left",
         } as TextElement);
@@ -1742,10 +1720,9 @@ class DrawingController {
         toRemove.push(el);
       }
     }
-    for (const el of toRemove) {
-      this.elements.delete(el.id);
-      this.pushUndo({ action: "remove", data: el });
-    }
+    if (toRemove.length === 0) return;
+    for (const el of toRemove) this.elements.delete(el.id);
+    this.pushRemoveUndo(toRemove);
     this.selectedIds.clear();
     this.rerenderElements();
     this.setState({ selected_ids: [] });
@@ -1786,9 +1763,8 @@ class DrawingController {
 
     if (isLine(element)) {
       const snapResult = findSnapPoint(point, this.elements, SNAP_THRESHOLD, element.id);
-      this.snapTarget = snapResult ? snapResult.point : null;
-      this.lastSnapResult = snapResult;
-      element.points[1] = snapResult ? snapResult.point : point;
+      this.setSnapResult(snapResult);
+      element.points[1] = snapResult?.point ?? point;
       this.requestPreviewUpdate();
       return;
     }
@@ -1804,7 +1780,7 @@ class DrawingController {
 
     const last = points[points.length - 1];
     const dist = Math.sqrt((point.x - last.x) ** 2 + (point.y - last.y) ** 2);
-    if (dist < 0.5) return;
+    if (dist < MIN_POINT_DISTANCE_VB) return;
 
     points.push(point);
     if (isPath(element)) {
@@ -1879,7 +1855,7 @@ class DrawingController {
     if (outlines) {
       for (const el of outlines) el.remove();
     }
-    this.doRenderHandles();
+    this.renderHandles();
   }
 
   private applyHistory(direction: "undo" | "redo"): void {
@@ -1888,10 +1864,21 @@ class DrawingController {
     const action = fromStack.pop();
     if (!action) return;
 
+    const existingIds = new Set(this.elements.keys());
     const result = processHistory(action, this.elements, direction);
     for (const id of result.elementsToDelete) this.elements.delete(id);
     for (const [id, el] of result.elementsToSet) this.elements.set(id, el);
     toStack.push(action);
+
+    const changes: ElementChangeEvent[] = [];
+    for (const id of result.elementsToDelete) {
+      changes.push({ type: "delete", elementId: id });
+    }
+    for (const [id, el] of result.elementsToSet) {
+      const eventType = existingIds.has(id) ? "update" : "create";
+      changes.push({ type: eventType, element: cloneElement(el) });
+    }
+    this.emitChanges(changes);
 
     this.rerenderElements();
     this.setState({
@@ -1922,7 +1909,7 @@ class DrawingController {
     for (const id of ids) {
       this.rerenderElement(id);
     }
-    this.doRenderHandles();
+    this.renderHandles();
   }
 
   /** Full DOM rebuild — clears and re-renders all elements. For cold paths (undo, delete, z-order, import). */
@@ -1940,26 +1927,18 @@ class DrawingController {
         this.selectedIds.delete(id);
       }
     }
-    this.updateSelectionVisual();
-    const { hasLine, hasText } = this.analyzeSelectionTypes();
-    this.setState({ selected_ids: Array.from(this.selectedIds), selected_is_line: hasLine, selected_is_text: hasText });
+    this.syncSelectionState();
   }
+
   selectAll(): void {
-    this.selectedIds.clear();
-    for (const id of this.elements.keys()) {
-      this.selectedIds.add(id);
-    }
-    const { hasLine, hasText } = this.analyzeSelectionTypes();
-    this.setState({ selected_ids: Array.from(this.selectedIds), selected_is_line: hasLine, selected_is_text: hasText });
-    this.updateSelectionVisual();
+    this.selectedIds = new Set(this.elements.keys());
+    this.syncSelectionState();
   }
 
   deselectAll(): void {
     this.selectedIds.clear();
     this.resetCycleState();
-    // Update signal store BEFORE rendering handles (renderHandles reads from store)
-    this.setState({ selected_ids: [], selected_is_line: false, selected_is_text: false });
-    this.updateSelectionVisual();
+    this.syncSelectionState();
   }
 
   deleteSelected(): void {
@@ -1974,25 +1953,10 @@ class DrawingController {
       }
     }
 
-    for (const [, el] of this.elements) {
-      if (isLine(el)) {
-        if (el.startBinding && this.selectedIds.has(el.startBinding.elementId)) {
-          el.startBinding = undefined;
-        }
-        if (el.endBinding && this.selectedIds.has(el.endBinding.elementId)) {
-          el.endBinding = undefined;
-        }
-      }
-    }
-
+    this.clearBindingsTo(this.selectedIds);
     this.selectedIds.clear();
     this.rerenderElements();
-
-    if (deletedElements.length === 1) {
-      this.pushUndo({ action: "remove", data: deletedElements[0] });
-    } else if (deletedElements.length > 1) {
-      this.pushUndo({ action: "remove_batch", data: deletedElements });
-    }
+    this.pushRemoveUndo(deletedElements);
     this.setState({ selected_ids: [] });
   }
 
@@ -2022,27 +1986,17 @@ class DrawingController {
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el) continue;
+      const before = this.captureElementPosition(el);
       if (isShape(el) || isText(el)) {
-        const before = { x: el.x, y: el.y };
         el.x += dx;
         el.y += dy;
-        moveData.push({ id, before, after: { x: el.x, y: el.y } });
       } else if (isLine(el)) {
-        const before: MovePosition = {
-          points: el.points.map(p => ({ ...p })),
-          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
-        };
         el.points = el.points.map(p => ({ x: p.x + dx, y: p.y + dy })) as [Point, Point];
         if (el.midpoint) el.midpoint = { x: el.midpoint.x + dx, y: el.midpoint.y + dy };
-        moveData.push({ id, before, after: {
-          points: el.points.map(p => ({ ...p })),
-          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
-        }});
       } else if (isPath(el)) {
-        const before: MovePosition = { points: el.points.map(p => ({ ...p })) };
         el.points = el.points.map(p => ({ x: p.x + dx, y: p.y + dy }));
-        moveData.push({ id, before, after: { points: el.points.map(p => ({ ...p })) } });
       }
+      moveData.push({ id, before, after: this.captureElementPosition(el) });
     }
     // Capture bound arrow positions before updateBoundArrows mutates them
     const ids = new Set(this.selectedIds);
@@ -2051,33 +2005,27 @@ class DrawingController {
       if (ids.has(id) || !isLine(el)) continue;
       if ((el.startBinding && ids.has(el.startBinding.elementId)) ||
           (el.endBinding && ids.has(el.endBinding.elementId))) {
-        boundArrowsBefore.set(id, {
-          points: el.points.map(p => ({ ...p })),
-          midpoint: el.midpoint ? { ...el.midpoint } : undefined,
-        });
+        boundArrowsBefore.set(id, this.captureElementPosition(el));
       }
     }
     this.updateBoundArrows(ids);
     for (const [id, before] of boundArrowsBefore) {
       const el = this.elements.get(id);
-      if (!el || !isLine(el)) continue;
-      moveData.push({ id, before, after: {
-        points: el.points.map(p => ({ ...p })),
-        midpoint: el.midpoint ? { ...el.midpoint } : undefined,
-      }});
+      if (!el) continue;
+      moveData.push({ id, before, after: this.captureElementPosition(el) });
     }
     if (moveData.length > 0) this.pushUndo({ action: "move", data: moveData });
     this.rerenderElementSet(ids);
   }
 
   private analyzeSelectionTypes(): { hasLine: boolean; hasText: boolean } {
-    let hasLine = false;
-    let hasText = false;
+    let hasLine = false, hasText = false;
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (!el) continue;
       if (el.type === "line" || el.type === "arrow") hasLine = true;
       if (el.type === "text") hasText = true;
+      if (hasLine && hasText) break;
     }
     return { hasLine, hasText };
   }
@@ -2092,8 +2040,8 @@ class DrawingController {
     if (el.type !== "text") patch.stroke_width = el.stroke_width;
     if (isShape(el) && el.fill_color) patch.fill_color = el.fill_color;
     if (isLine(el)) {
-      patch.start_arrowhead = el.start_arrowhead || "none";
-      patch.end_arrowhead = el.end_arrowhead || "none";
+      patch.start_arrowhead = el.start_arrowhead ?? "none";
+      patch.end_arrowhead = el.end_arrowhead ?? "none";
     }
     if (isText(el)) {
       patch.font_family = el.font_family;
@@ -2112,10 +2060,10 @@ class DrawingController {
       dup.id = `${original.type}-${crypto.randomUUID().split("-")[0]}`;
       dup.created_at = Date.now();
       if (isShape(dup) || isText(dup)) {
-        dup.x += 2;
-        dup.y += 2;
+        dup.x += DUPLICATE_OFFSET_VB;
+        dup.y += DUPLICATE_OFFSET_VB;
       } else if (isLine(dup) || isPath(dup)) {
-        dup.points = dup.points.map((p) => ({ x: p.x + 2, y: p.y + 2 })) as typeof dup.points;
+        dup.points = dup.points.map((p) => ({ x: p.x + DUPLICATE_OFFSET_VB, y: p.y + DUPLICATE_OFFSET_VB })) as typeof dup.points;
       }
       duplicates.push(dup);
     }
@@ -2137,6 +2085,7 @@ class DrawingController {
       this.elements.set(el.id, el);
     }
 
+    this.emitChanges([{ type: "reorder", order: [...this.elements.keys()] }]);
     this.rerenderElements();
   }
 
@@ -2155,7 +2104,74 @@ class DrawingController {
     }
     this.elements = newMap;
 
+    this.emitChanges([{ type: "reorder", order: [...this.elements.keys()] }]);
     this.rerenderElements();
+  }
+
+  applyRemoteChanges(changes: ElementChangeEvent[]): void {
+    if (changes.length === 0) return;
+    const affectedIds = new Set<string>();
+    let needsFullRerender = false;
+
+    for (const change of changes) {
+      switch (change.type) {
+        case "create":
+        case "update": {
+          this.elements.set(change.element.id, change.element);
+          const existing = this.elementsGroup?.querySelector(`#${change.element.id}`);
+          if (existing) {
+            const newEl = this.renderElement(change.element);
+            if (newEl) { existing.replaceWith(newEl); this.measureTextElement(change.element.id); }
+          } else {
+            const svgEl = this.renderElement(change.element);
+            if (svgEl && this.elementsGroup) this.elementsGroup.appendChild(svgEl);
+            this.measureTextElement(change.element.id);
+          }
+          affectedIds.add(change.element.id);
+          break;
+        }
+        case "delete": {
+          this.elements.delete(change.elementId);
+          this.textBoundsCache.delete(change.elementId);
+          this.elementsGroup?.querySelector(`#${change.elementId}`)?.remove();
+          if (this.selectedIds.delete(change.elementId)) {
+            this.setState({ selected_ids: [...this.selectedIds] });
+          }
+          this.clearBindingsTo(new Set([change.elementId]));
+          break;
+        }
+        case "reorder": {
+          const newMap = new Map<string, DrawingElement>();
+          for (const id of change.order) {
+            const el = this.elements.get(id);
+            if (el) newMap.set(id, el);
+          }
+          // Preserve any local elements not in the remote order list
+          for (const [id, el] of this.elements) {
+            if (!newMap.has(id)) newMap.set(id, el);
+          }
+          this.elements = newMap;
+          needsFullRerender = true;
+          break;
+        }
+      }
+    }
+
+    if (needsFullRerender) {
+      this.rerenderElements();
+    } else {
+      this.updateBoundArrows(affectedIds);
+      this.renderHandles();
+    }
+  }
+
+  getSnapshot(): ElementChangeEvent[] {
+    const changes: ElementChangeEvent[] = [];
+    for (const el of this.elements.values()) {
+      changes.push({ type: "create", element: cloneElement(el) });
+    }
+    changes.push({ type: "reorder", order: [...this.elements.keys()] });
+    return changes;
   }
 }
 

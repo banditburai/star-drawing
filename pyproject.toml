@@ -1,0 +1,82 @@
+[project]
+name = "star-drawing"
+version = "0.1.0"
+description = "SVG drawing canvas web component for StarHTML/Datastar"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["starelements>=0.1.0"]
+
+[tool.uv.sources]
+# Local override for development only; ignored when installed from PyPI
+starelements = { path = "../starelements", editable = true }
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-cov>=6.1.1"]
+dev = ["ruff", "pyright", "pip-tools"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+path = "scripts/hatch_build_hook.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/star_drawing"]
+include = [
+    "src/star_drawing/**/*.py",
+    "src/star_drawing/static/**/*.js",
+]
+artifacts = []
+exclude = [
+    "typescript/",
+    "package.json",
+    "tsconfig.json",
+    "node_modules/",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".github/",
+    "uv.lock",
+    "tsconfig.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "C90", "PL"]
+ignore = [
+    "E501",    # line length (handled by formatter)
+    "E701",    # multiple statements on one line
+    "PLR0913", # too many arguments
+    "C901",    # too complex
+    "N802",    # function name lowercase (FT constructors)
+    "PLR0912", # too many branches
+    "PLR0911", # too many return statements
+    "PLC0415", # import not at top-level (lazy imports to avoid circular deps)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["F403", "F405", "PLR2004", "N806", "F841", "PLC0415"]
+"examples/*.py" = ["F403", "F405", "PLR2004", "N802", "PLW0603", "E402", "F841", "PLC0415"]
+"src/star_drawing/__init__.py" = ["F401", "PLR0915"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

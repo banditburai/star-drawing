@@ -72,6 +72,19 @@ export const DEFAULT_CONFIG: DrawingConfig = {
 
 // viewBox units, 0-100 coordinate space
 export const SNAP_THRESHOLD = 1.5;
+export const TEXT_MARGIN_VB = 2;
+export const MIN_TEXT_WIDTH_VB = 10;
+export const MIN_POINT_DISTANCE_VB = 0.5;
+export const DUPLICATE_OFFSET_VB = 2;
+
+export const DOUBLE_CLICK_MS = 400;
+export const BLUR_COMMIT_DELAY_MS = 100;
+export const NUDGE_STEP = 1;
+export const NUDGE_STEP_SHIFT = 5;
+export const ROTATION_SNAP_DEG = 15;
+export const PREVIEW_OPACITY = 0.6;
+export const TEXT_LINE_HEIGHT = 1.4;
+export const MIN_TEXTAREA_WIDTH_PX = 40;
 
 export const toolCursorMap: Record<Tool, string> = {
   select: "default",

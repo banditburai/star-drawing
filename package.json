@@ -1,0 +1,10 @@
+{
+  "name": "star-drawing",
+  "version": "0.1.0",
+  "description": "SVG drawing canvas web component for StarHTML/Datastar",
+  "type": "module",
+  "scripts": {
+    "build": "bun build typescript/index.ts --outfile=src/star_drawing/static/drawing-canvas.js --minify --target=browser",
+    "dev": "bun build typescript/index.ts --outfile=src/star_drawing/static/drawing-canvas.js --target=browser --watch"
+  }
+}

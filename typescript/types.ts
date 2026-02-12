@@ -134,6 +134,7 @@ export interface DrawingConfig {
   defaultTool: Tool;
   defaultLayer: Layer;
   throttleMs: number;
+  readonly?: boolean;
 }
 
 export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
@@ -195,6 +196,12 @@ export interface GroupRotationState {
   center: Point;
   startAngle: number;
 }
+
+export type ElementChangeEvent =
+  | { type: "create"; element: DrawingElement }
+  | { type: "update"; element: DrawingElement }
+  | { type: "delete"; elementId: string }
+  | { type: "reorder"; order: string[] };
 
 export type UndoAction =
   | { action: "add"; data: DrawingElement }

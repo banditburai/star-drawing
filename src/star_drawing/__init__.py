@@ -107,10 +107,23 @@ _SIGNALS = {
 }
 
 _METHODS = (
-    "switch_tool", "undo", "redo", "delete_selected", "select_all",
-    "deselect_all", "duplicate_selected", "bring_to_front", "send_to_back",
-    "set_text_property", "set_style_property", "set_dash_preset",
-    "export_svg", "import_svg", "clear",
+    "switch_tool",
+    "undo",
+    "redo",
+    "delete_selected",
+    "select_all",
+    "deselect_all",
+    "duplicate_selected",
+    "bring_to_front",
+    "send_to_back",
+    "set_text_property",
+    "set_style_property",
+    "set_dash_preset",
+    "export_svg",
+    "import_svg",
+    "clear",
+    "apply_remote_changes",
+    "get_snapshot",
 )
 
 # ---------------------------------------------------------------------------
@@ -149,6 +162,7 @@ def DrawingCanvas():
 
             const signalPrefix = el.getAttribute('signal') || 'drawing';
 
+            const isReadonly = el.hasAttribute('readonly');
             const config = {
                 defaultTool: el.getAttribute('default-tool') || 'pen',
                 defaultStrokeColor: el.getAttribute('default-stroke-color') || '#1a1a2e',
@@ -158,6 +172,7 @@ def DrawingCanvas():
                 defaultLayer: el.getAttribute('default-layer') || 'default',
                 throttleMs: Number(el.getAttribute('throttle-ms')) || 16,
                 signal: signalPrefix,
+                readonly: isReadonly,
             };
 
             const controller = new DrawingController(el, config, {
@@ -170,6 +185,9 @@ def DrawingCanvas():
                         globalPatch[signalPrefix + '_' + key] = value;
                     }
                     datastar.mergePatch(globalPatch);
+                },
+                onElementChange: (changes) => {
+                    el.dispatchEvent(new CustomEvent('element-change', { detail: changes, bubbles: true }));
                 },
             });
 
@@ -189,6 +207,8 @@ def DrawingCanvas():
                 exportSvg: () => controller.exportSvg(),
                 importSvg: (svg) => controller.importSvg(svg),
                 clear: (layer) => controller.clear(layer),
+                applyRemoteChanges: (changes) => controller.applyRemoteChanges(changes),
+                getSnapshot: () => controller.getSnapshot(),
             };
             Object.assign(el, methods);
 
@@ -260,9 +280,14 @@ def _labeled_slider(label, *, signal, on_input, min, max, step, show=None):
             cls="panel-section-header",
         ),
         Input(
-            type="range", min=min, max=max, step=step,
-            data_bind=signal, data_on_input=on_input,
-            cls="styled-slider full-width", aria_label=label,
+            type="range",
+            min=min,
+            max=max,
+            step=step,
+            data_bind=signal,
+            data_on_input=on_input,
+            cls="styled-slider full-width",
+            aria_label=label,
         ),
         cls="panel-section",
         **kw,
@@ -289,8 +314,16 @@ def drawing_toolbar(
     canvas,
     *,
     tools: tuple[str, ...] = (
-        "select", "pen", "highlighter", "line", "arrow",
-        "rect", "ellipse", "diamond", "text", "eraser",
+        "select",
+        "pen",
+        "highlighter",
+        "line",
+        "arrow",
+        "rect",
+        "ellipse",
+        "diamond",
+        "text",
+        "eraser",
     ),
     show_colors: bool = True,
     show_undo: bool = True,
@@ -366,16 +399,38 @@ def drawing_toolbar(
             bar_items.extend(btns)
 
     if show_undo:
-        bar_items.extend([
-            _divider(),
-            Button(Icon("lucide:undo-2", size=18), data_on_click=canvas.undo(), data_attr_disabled=~can_undo, cls="action-btn", title="Undo"),
-            Button(Icon("lucide:redo-2", size=18), data_on_click=canvas.redo(), data_attr_disabled=~can_redo, cls="action-btn", title="Redo"),
-            Button(Icon("lucide:trash-2", size=18), data_on_click=canvas.clear(), cls="action-btn danger", title="Clear canvas"),
-        ])
+        bar_items.extend(
+            [
+                _divider(),
+                Button(
+                    Icon("lucide:undo-2", size=18),
+                    data_on_click=canvas.undo(),
+                    data_attr_disabled=~can_undo,
+                    cls="action-btn",
+                    title="Undo",
+                ),
+                Button(
+                    Icon("lucide:redo-2", size=18),
+                    data_on_click=canvas.redo(),
+                    data_attr_disabled=~can_redo,
+                    cls="action-btn",
+                    title="Redo",
+                ),
+                Button(
+                    Icon("lucide:trash-2", size=18),
+                    data_on_click=canvas.clear(),
+                    cls="action-btn danger",
+                    title="Clear canvas",
+                ),
+            ]
+        )
 
     if show_colors:
         color_trigger = Div(
-            Div(cls="color-trigger-fill", data_attr_style=fill_enabled.if_("background-color:" + fill_color, "display:none")),
+            Div(
+                cls="color-trigger-fill",
+                data_attr_style=fill_enabled.if_("background-color:" + fill_color, "display:none"),
+            ),
             cls="color-trigger",
             data_on_click=[color_open.toggle(), style_open.set(False)],
             data_attr_style="background-color:" + stroke_color,
@@ -386,48 +441,75 @@ def drawing_toolbar(
         )
 
         stroke_picker = Input(
-            type="color", data_bind=stroke_color,
+            type="color",
+            data_bind=stroke_color,
             data_on_input=canvas.set_style_property("stroke_color", evt.target.value),
-            cls="color-picker", title="Custom stroke color", aria_label="Custom stroke color",
+            cls="color-picker",
+            title="Custom stroke color",
+            aria_label="Custom stroke color",
         )
         fill_picker = Input(
-            type="color", data_bind=fill_color,
-            data_on_input=[canvas.set_style_property("fill_color", evt.target.value), canvas.set_style_property("fill_enabled", True)],
-            cls="color-picker", title="Custom fill color", aria_label="Custom fill color",
+            type="color",
+            data_bind=fill_color,
+            data_on_input=[
+                canvas.set_style_property("fill_color", evt.target.value),
+                canvas.set_style_property("fill_enabled", True),
+            ],
+            cls="color-picker",
+            title="Custom fill color",
+            aria_label="Custom fill color",
         )
         no_fill_btn = Button(
             Div(cls="no-fill-swatch"),
-            data_on_click=[canvas.set_style_property("fill_enabled", False), canvas.set_style_property("fill_color", "")],
+            data_on_click=[
+                canvas.set_style_property("fill_enabled", False),
+                canvas.set_style_property("fill_color", ""),
+            ],
             data_class_selected=~fill_enabled,
             cls="color-swatch",
             title="No fill",
         )
 
         color_panel = [
-            _panel_section("Stroke", _swatch_grid(
-                colors,
-                on_click=lambda c: canvas.set_style_property("stroke_color", c),
-                selected=lambda c: stroke_color == c,
-                picker=stroke_picker,
-            )),
-            _panel_section("Fill", _swatch_grid(
-                fills,
-                on_click=lambda c: [canvas.set_style_property("fill_color", c), canvas.set_style_property("fill_enabled", True)],
-                selected=lambda c: (fill_color == c) & fill_enabled,
-                picker=fill_picker,
-                prefix=[no_fill_btn],
-            )),
-            _panel_section("Highlighter", _swatch_grid(
-                highlighters,
-                on_click=lambda c: canvas.set_style_property("stroke_color", c),
-                selected=lambda c: stroke_color == c,
-            ), show=tool == "highlighter"),
+            _panel_section(
+                "Stroke",
+                _swatch_grid(
+                    colors,
+                    on_click=lambda c: canvas.set_style_property("stroke_color", c),
+                    selected=lambda c: stroke_color == c,
+                    picker=stroke_picker,
+                ),
+            ),
+            _panel_section(
+                "Fill",
+                _swatch_grid(
+                    fills,
+                    on_click=lambda c: [
+                        canvas.set_style_property("fill_color", c),
+                        canvas.set_style_property("fill_enabled", True),
+                    ],
+                    selected=lambda c: (fill_color == c) & fill_enabled,
+                    picker=fill_picker,
+                    prefix=[no_fill_btn],
+                ),
+            ),
+            _panel_section(
+                "Highlighter",
+                _swatch_grid(
+                    highlighters,
+                    on_click=lambda c: canvas.set_style_property("stroke_color", c),
+                    selected=lambda c: stroke_color == c,
+                ),
+                show=tool == "highlighter",
+            ),
         ]
 
-        bar_items.extend([
-            _divider(),
-            _popover(color_trigger, *color_panel, panel_id=f"{canvas._name}-color-panel", show_expr=color_open),
-        ])
+        bar_items.extend(
+            [
+                _divider(),
+                _popover(color_trigger, *color_panel, panel_id=f"{canvas._name}-color-panel", show_expr=color_open),
+            ]
+        )
 
     if show_styles:
         style_trigger = Button(
@@ -439,43 +521,127 @@ def drawing_toolbar(
         )
 
         style_panel = [
-            _panel_section("Width", Div(
-                *[
+            _panel_section(
+                "Width",
+                Div(
+                    *[
+                        Button(
+                            Div(cls="width-dot", style=f"width:{min(sz * 2, 14)}px;height:{min(sz * 2, 14)}px"),
+                            data_on_click=canvas.set_style_property("stroke_width", sz),
+                            data_class_selected=stroke_width == sz,
+                            cls="style-btn width-btn",
+                            title=f"{sz}px",
+                        )
+                        for sz in widths
+                    ],
+                    cls="btn-row",
+                ),
+                show=show_width,
+            ),
+            _panel_section(
+                "Stroke",
+                Div(
                     Button(
-                        Div(cls="width-dot", style=f"width:{min(sz * 2, 14)}px;height:{min(sz * 2, 14)}px"),
-                        data_on_click=canvas.set_style_property("stroke_width", sz),
-                        data_class_selected=stroke_width == sz,
-                        cls="style-btn width-btn",
-                        title=f"{sz}px",
-                    )
-                    for sz in widths
-                ],
-                cls="btn-row",
-            ), show=show_width),
-            _panel_section("Stroke", Div(
-                Button(Div(cls="dash-preview solid"), data_on_click=canvas.set_dash_preset("solid"), data_class_selected=(dash_length == 0) & (dash_gap == 0), cls="style-btn", title="Solid"),
-                Button(Div(cls="dash-preview dashed"), data_on_click=canvas.set_dash_preset("dashed"), data_class_selected=dash_length >= 1, cls="style-btn", title="Dashed"),
-                Button(Div(cls="dash-preview dotted"), data_on_click=canvas.set_dash_preset("dotted"), data_class_selected=(dash_length < 1) & (dash_gap > 0), cls="style-btn", title="Dotted"),
-                cls="btn-row",
-            ), show=show_stroke),
+                        Div(cls="dash-preview solid"),
+                        data_on_click=canvas.set_dash_preset("solid"),
+                        data_class_selected=(dash_length == 0) & (dash_gap == 0),
+                        cls="style-btn",
+                        title="Solid",
+                    ),
+                    Button(
+                        Div(cls="dash-preview dashed"),
+                        data_on_click=canvas.set_dash_preset("dashed"),
+                        data_class_selected=dash_length >= 1,
+                        cls="style-btn",
+                        title="Dashed",
+                    ),
+                    Button(
+                        Div(cls="dash-preview dotted"),
+                        data_on_click=canvas.set_dash_preset("dotted"),
+                        data_class_selected=(dash_length < 1) & (dash_gap > 0),
+                        cls="style-btn",
+                        title="Dotted",
+                    ),
+                    cls="btn-row",
+                ),
+                show=show_stroke,
+            ),
             # Progressive disclosure: fine-tuning shown after selecting dashed/dotted
-            _labeled_slider("Dash size", signal=dash_length, on_input=canvas.set_style_property("dash_length", js("Number(evt.target.value)")), min="2", max="12", step="1", show=show_stroke & (dash_length >= 1)),
-            _labeled_slider("Dot spacing", signal=dash_gap, on_input=canvas.set_style_property("dash_gap", js("Number(evt.target.value)")), min="2", max="12", step="0.5", show=show_stroke & (dash_length < 1) & (dash_gap > 0)),
-            _labeled_slider("Opacity", signal=opacity, on_input=canvas.set_style_property("opacity", evt.target.value), min="0", max="1", step="0.1"),
+            _labeled_slider(
+                "Dash size",
+                signal=dash_length,
+                on_input=canvas.set_style_property("dash_length", js("Number(evt.target.value)")),
+                min="2",
+                max="12",
+                step="1",
+                show=show_stroke & (dash_length >= 1),
+            ),
+            _labeled_slider(
+                "Dot spacing",
+                signal=dash_gap,
+                on_input=canvas.set_style_property("dash_gap", js("Number(evt.target.value)")),
+                min="2",
+                max="12",
+                step="0.5",
+                show=show_stroke & (dash_length < 1) & (dash_gap > 0),
+            ),
+            _labeled_slider(
+                "Opacity",
+                signal=opacity,
+                on_input=canvas.set_style_property("opacity", evt.target.value),
+                min="0",
+                max="1",
+                step="0.1",
+            ),
             Div(
-                _panel_section("Start", _btn_row(arrows, on_click=lambda v: canvas.set_style_property("start_arrowhead", v), selected=lambda v: start_arrowhead == v)),
-                _panel_section("End", _btn_row(arrows, on_click=lambda v: canvas.set_style_property("end_arrowhead", v), selected=lambda v: end_arrowhead == v)),
+                _panel_section(
+                    "Start",
+                    _btn_row(
+                        arrows,
+                        on_click=lambda v: canvas.set_style_property("start_arrowhead", v),
+                        selected=lambda v: start_arrowhead == v,
+                    ),
+                ),
+                _panel_section(
+                    "End",
+                    _btn_row(
+                        arrows,
+                        on_click=lambda v: canvas.set_style_property("end_arrowhead", v),
+                        selected=lambda v: end_arrowhead == v,
+                    ),
+                ),
                 data_show=(tool == "arrow") | selected_is_line,
             ),
             Div(
-                _panel_section("Font", _btn_row(fonts, on_click=lambda v: canvas.set_text_property("font_family", v), selected=lambda v: font_family == v)),
-                _panel_section("Size", _btn_row(sizes, on_click=lambda v: canvas.set_text_property("font_size", v), selected=lambda v: font_size == v)),
-                _panel_section("Align", _btn_row(
-                    [("lucide:align-left", "left"), ("lucide:align-center", "center"), ("lucide:align-right", "right")],
-                    on_click=lambda v: canvas.set_text_property("text_align", v),
-                    selected=lambda v: text_align == v,
-                    label=lambda ico, _: Icon(ico, size=14),
-                )),
+                _panel_section(
+                    "Font",
+                    _btn_row(
+                        fonts,
+                        on_click=lambda v: canvas.set_text_property("font_family", v),
+                        selected=lambda v: font_family == v,
+                    ),
+                ),
+                _panel_section(
+                    "Size",
+                    _btn_row(
+                        sizes,
+                        on_click=lambda v: canvas.set_text_property("font_size", v),
+                        selected=lambda v: font_size == v,
+                    ),
+                ),
+                _panel_section(
+                    "Align",
+                    _btn_row(
+                        [
+                            ("lucide:align-left", "left"),
+                            ("lucide:align-center", "center"),
+                            ("lucide:align-right", "right"),
+                        ],
+                        on_click=lambda v: canvas.set_text_property("text_align", v),
+                        selected=lambda v: text_align == v,
+                        label=lambda ico, _: Icon(ico, size=14),
+                    ),
+                ),
                 data_show=is_text_ctx,
             ),
         ]
