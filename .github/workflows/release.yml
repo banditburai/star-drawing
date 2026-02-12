@@ -18,6 +18,8 @@ jobs:
   build-and-validate:
     name: Build and Validate Package
     runs-on: ubuntu-latest
+    env:
+      UV_NO_SOURCES: "1"
 
     steps:
     - name: Checkout code
@@ -32,7 +34,7 @@ jobs:
       run: uv python install 3.12
 
     - name: Install dependencies
-      run: uv sync --all-extras --no-sources
+      run: uv sync --all-extras
 
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2
