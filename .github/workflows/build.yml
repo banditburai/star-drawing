@@ -9,8 +9,10 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'pyproject.toml'
+      - '.github/workflows/build.yml'
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   validate:
