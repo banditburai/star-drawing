@@ -68,6 +68,8 @@ export const DEFAULT_CONFIG: DrawingConfig = {
   defaultTool: "pen",
   defaultLayer: "default",
   throttleMs: 8,
+  viewBoxWidth: 100,
+  viewBoxHeight: 100,
 };
 
 // viewBox units, 0-100 coordinate space
