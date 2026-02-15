@@ -171,6 +171,8 @@ def DrawingCanvas():
                 defaultOpacity: Number(el.getAttribute('default-opacity')) || 1,
                 defaultLayer: el.getAttribute('default-layer') || 'default',
                 throttleMs: Number(el.getAttribute('throttle-ms')) || 16,
+                viewBoxWidth: Number(el.getAttribute('viewbox-width')) || 100,
+                viewBoxHeight: Number(el.getAttribute('viewbox-height')) || 100,
                 signal: signalPrefix,
                 readonly: isReadonly,
             };
@@ -237,7 +239,6 @@ def _popover(trigger, *children, panel_id: str, show_expr, **panel_kw):
 
 
 def _swatch_grid(swatches, *, on_click, selected, picker=None, prefix=None):
-    """Color swatch grid with optional custom color picker and prefix buttons."""
     items: list[Any] = list(prefix) if prefix else []
     items.extend(
         Button(
@@ -255,7 +256,6 @@ def _swatch_grid(swatches, *, on_click, selected, picker=None, prefix=None):
 
 
 def _btn_row(options, *, on_click, selected, label=None):
-    """Row of style buttons from (label, value) pairs."""
     return Div(
         *[
             Button(
@@ -271,7 +271,6 @@ def _btn_row(options, *, on_click, selected, label=None):
 
 
 def _labeled_slider(label, *, signal, on_input, min, max, step, show=None):
-    """Panel section with a labeled range slider."""
     kw = {"data_show": show} if show is not None else {}
     return Div(
         Div(
@@ -295,7 +294,6 @@ def _labeled_slider(label, *, signal, on_input, min, max, step, show=None):
 
 
 def _panel_section(label, content, *, show=None):
-    """Labeled panel section with optional visibility."""
     kw = {"data_show": show} if show is not None else {}
     return Div(
         Span(label, cls="panel-label"),
@@ -339,7 +337,7 @@ def drawing_toolbar(
 ) -> Any:
     """Compact toolbar with popover panels for a drawing canvas.
 
-    Style panel auto-opens for text/arrow tools.
+    Style panel auto-opens on first use of text/arrow tools.
     Sections are context-filtered by active tool.
     """
     colors = color_palette or COLOR_PALETTE
@@ -372,27 +370,37 @@ def drawing_toolbar(
 
     style_open = canvas.signal("style_open", False, type_=bool)
     color_open = canvas.signal("color_open", False, type_=bool)
+    text_seen = canvas.signal("text_seen", False, type_=bool)
+    arrow_seen = canvas.signal("arrow_seen", False, type_=bool)
 
     is_text_ctx = (tool == "text") | text_editing | selected_is_text
     not_freehand = (tool != "pen") & (tool != "highlighter")
     show_width = ~is_text_ctx
     show_stroke = not_freehand & ~is_text_ctx
-    style_panel_show = style_open | (tool == "text") | (tool == "arrow")
+    style_panel_show = style_open
 
     tool_set = set(tools)
     bar_items: list[Any] = []
     for group in groups:
-        btns = [
-            Button(
-                Icon(TOOL_ICONS[tid], size=20),
-                data_on_click=[canvas.switch_tool(tid), style_open.set(False), color_open.set(False)],
-                data_class_selected=tool == tid,
-                cls="tool-btn",
-                title=tip,
+        btns = []
+        for tid, tip in group:
+            if tid not in tool_set:
+                continue
+            if tid == "arrow":
+                style_actions = [style_open.set(~arrow_seen), arrow_seen.set(True)]
+            elif tid == "text":
+                style_actions = [style_open.set(~text_seen), text_seen.set(True)]
+            else:
+                style_actions = [style_open.set(False)]
+            btns.append(
+                Button(
+                    Icon(TOOL_ICONS[tid], size=20),
+                    data_on_click=[canvas.switch_tool(tid), *style_actions, color_open.set(False)],
+                    data_class_selected=tool == tid,
+                    cls="tool-btn",
+                    title=tip,
+                )
             )
-            for tid, tip in group
-            if tid in tool_set
-        ]
         if btns:
             if bar_items:
                 bar_items.append(_divider())
@@ -651,7 +659,10 @@ def drawing_toolbar(
         )
 
     # Preseed so data-bind inputs don't evaluate to undefined before component init
-    preseed = {sig._id: sig._initial for sig in [stroke_color, fill_color, fill_enabled, color_open, style_open]}
+    preseed = {
+        sig._id: sig._initial
+        for sig in [stroke_color, fill_color, fill_enabled, color_open, style_open, text_seen, arrow_seen]
+    }
 
     return Div(
         Div(*bar_items, cls="toolbar-bar"),

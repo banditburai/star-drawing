@@ -135,6 +135,8 @@ export interface DrawingConfig {
   defaultLayer: Layer;
   throttleMs: number;
   readonly?: boolean;
+  viewBoxWidth: number;
+  viewBoxHeight: number;
 }
 
 export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";

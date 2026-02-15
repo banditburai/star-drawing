@@ -5,7 +5,7 @@ description = "SVG drawing canvas web component for StarHTML/Datastar"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-dependencies = ["starelements>=0.1.1"]
+dependencies = ["starelements>=0.1.2"]
 
 [tool.uv.sources]
 # Local override for development only; ignored when installed from PyPI

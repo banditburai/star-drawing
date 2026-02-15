@@ -167,7 +167,7 @@ class DrawingController {
       opacity: defaultToolSettings.opacity ?? config.defaultOpacity,
       selected_ids: [],
       active_layer: config.defaultLayer,
-      font_family: "normal",
+      font_family: "hand-drawn",
       font_size: "medium",
       text_align: "left",
       start_arrowhead: defaultToolSettings.start_arrowhead ?? "none",
@@ -198,8 +198,10 @@ class DrawingController {
   private createSvgLayer(): void {
     this.svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     this.svg.setAttribute("class", "drawing-svg");
-    this.svg.setAttribute("viewBox", "0 0 100 100");
-    this.svg.setAttribute("preserveAspectRatio", "none");
+    const w = this.config.viewBoxWidth;
+    const h = this.config.viewBoxHeight;
+    this.svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    this.svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
 
     const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
     this.svg.appendChild(defs);
@@ -468,8 +470,8 @@ class DrawingController {
   private startTextEditing(svgPoint: Point, existingElement?: TextElement): void {
     if (this.textEdit) return;
 
-    const rect = this.svgRect;
-    if (!rect) return;
+    const ctm = this.getScreenCTM();
+    if (!ctm) return;
 
     const isEditing = !!existingElement;
     const fontFamily = isEditing ? existingElement.font_family : this.state.font_family;
@@ -480,16 +482,17 @@ class DrawingController {
     const pos = this.svgToContainerPx(svgPoint.x, svgPoint.y);
     const fontSizePx = this.svgUnitsToPx(fontSize, "y");
 
-    // Max-width uses "y" axis because the textarea has scaleX(rect.width/rect.height)
+    const stretchX = ctm.a / ctm.d;
+
     const availableVB = existingElement?.width ?? (
-      textAlign === "center" ? 2 * Math.min(svgPoint.x, 100 - svgPoint.x) - TEXT_MARGIN_VB * 2
+      textAlign === "center" ? 2 * Math.min(svgPoint.x, this.config.viewBoxWidth - svgPoint.x) - TEXT_MARGIN_VB * 2
       : textAlign === "right" ? svgPoint.x - TEXT_MARGIN_VB
-      : 100 - TEXT_MARGIN_VB - svgPoint.x
+      : this.config.viewBoxWidth - TEXT_MARGIN_VB - svgPoint.x
     );
     const maxWidthVB = Math.max(MIN_TEXT_WIDTH_VB, availableVB);
     const maxWidthPx = this.svgUnitsToPx(maxWidthVB, "y");
 
-    const textarea = this.createTextOverlay(pos, fontSizePx, rect.width / rect.height, fontFamily, textAlign, color, existingElement?.text, maxWidthPx);
+    const textarea = this.createTextOverlay(pos, fontSizePx, stretchX, fontFamily, textAlign, color, existingElement?.text, maxWidthPx);
 
     const state: TextEditState = {
       overlay: textarea,
@@ -682,12 +685,12 @@ class DrawingController {
 
   private updateTextOverlay(el: TextElement): void {
     if (!this.textEdit) return;
-    const rect = this.svgRect;
-    if (!rect) return;
 
     const pos = this.svgToContainerPx(el.x, el.y);
     const fontSizePx = this.svgUnitsToPx(el.font_size, "y");
-    const transformCss = this.computeTextTransform(el.text_align, rect.width / rect.height);
+    const ctm = this.getScreenCTM();
+    const stretchX = ctm ? ctm.a / ctm.d : 1;
+    const transformCss = this.computeTextTransform(el.text_align, stretchX);
 
     Object.assign(this.textEdit.overlay.style, {
       left: `${pos.left}px`,
@@ -1097,32 +1100,53 @@ class DrawingController {
     this.cancelDrawing();
   }
 
+  /** Get the cached screen-to-SVG transformation matrix. Accounts for viewBox + preserveAspectRatio. */
+  private getScreenCTM(): DOMMatrix | null {
+    return this.svg?.getScreenCTM() ?? null;
+  }
+
   private pointerToSvgCoords(e: PointerEvent): Point {
-    const rect = this.svgRect;
-    if (!rect || rect.width === 0 || rect.height === 0) return { x: 0, y: 0 };
+    const ctm = this.getScreenCTM();
+    if (!ctm) return { x: 0, y: 0 };
+    const pt = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
+    return { x: pt.x, y: pt.y };
+  }
+
+  /** Effective CSS scale of the container (accounts for ancestor transforms like slide-scaler). */
+  private containerCssScale(): { x: number; y: number } {
+    const el = this.container;
+    const rect = el.getBoundingClientRect();
     return {
-      x: ((e.clientX - rect.left) / rect.width) * 100,
-      y: ((e.clientY - rect.top) / rect.height) * 100,
+      x: rect.width / el.offsetWidth || 1,
+      y: rect.height / el.offsetHeight || 1,
     };
   }
 
   private svgToContainerPx(svgX: number, svgY: number): { left: number; top: number } {
+    const ctm = this.getScreenCTM();
     const rect = this.svgRect;
-    if (!rect) return { left: 0, top: 0 };
-    return { left: (svgX / 100) * rect.width, top: (svgY / 100) * rect.height };
+    if (!ctm || !rect) return { left: 0, top: 0 };
+    const pt = new DOMPoint(svgX, svgY).matrixTransform(ctm);
+    // Convert screen pixels → container-local CSS pixels (undo ancestor transforms)
+    const scale = this.containerCssScale();
+    return { left: (pt.x - rect.left) / scale.x, top: (pt.y - rect.top) / scale.y };
   }
 
   private svgUnitsToPx(units: number, axis: "x" | "y"): number {
-    const rect = this.svgRect;
-    if (!rect) return 0;
-    return axis === "x" ? (units / 100) * rect.width : (units / 100) * rect.height;
+    const ctm = this.getScreenCTM();
+    if (!ctm) return 0;
+    // ctm.a = X scale, ctm.d = Y scale (with meet, they're equal)
+    // Divide by CSS scale to get container-local pixels
+    const scale = this.containerCssScale();
+    return axis === "x" ? (units * ctm.a) / scale.x : (units * ctm.d) / scale.y;
   }
 
   /** Convert screen pixels to viewBox units for hit-test tolerance. */
   private screenToViewBoxTolerance(px: number): number {
-    const rect = this.svgRect;
-    if (!rect) return 1;
-    return (px / Math.min(rect.width, rect.height)) * 100;
+    const ctm = this.getScreenCTM();
+    if (!ctm) return 1;
+    const scale = Math.min(Math.abs(ctm.a), Math.abs(ctm.d));
+    return scale > 0 ? px / scale : 1;
   }
 
   private getClickCycleElement(svgPoint: Point): DrawingElement | null {
@@ -1699,7 +1723,7 @@ class DrawingController {
           x: num(el, "x"), y: num(el, "y"),
           text: el.textContent ?? "",
           font_size: num(el, "font-size", fontSizeMap.medium),
-          font_family: "normal",
+          font_family: "hand-drawn",
           text_align: "left",
         } as TextElement);
       }
