@@ -1,6 +1,6 @@
 [project]
 name = "star-drawing"
-version = "0.1.0"
+version = "0.1.1"
 description = "SVG drawing canvas web component for StarHTML/Datastar"
 readme = "README.md"
 requires-python = ">=3.12"
