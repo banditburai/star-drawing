@@ -1,8 +1,7 @@
-import { cursorForHandle } from "./constants.js";
+import { cursorForHandle, THEME_COLORS } from "./constants.js";
 import {
   getBoundingBox,
   getGroupBoundingBox,
-  getRotatedCursor,
   rotatePoint,
 } from "./geometry.js";
 import type {
@@ -12,27 +11,84 @@ import type {
   HandleType,
   LineElement,
   Point,
+  ThemeColors,
 } from "./types.js";
 import { isLine, isText } from "./types.js";
 
-// ─── Snap indicator ────────────────────────────────────────────────────────
+const ROTATION_HANDLE_GAP = 3.5;
+const MIDPOINT_HANDLE_OFFSET = 2;
 
-export function createSnapIndicator(point: Point): SVGCircleElement {
+// Snap handle cursor to nearest 45° octant, adjusted for element rotation
+const HANDLE_BASE_ANGLE: Partial<Record<HandleType, number>> = {
+  n: 0, ne: 45, e: 90, se: 135, s: 180, sw: 225, w: 270, nw: 315,
+};
+const CURSOR_BY_OCTANT = [
+  "ns-resize", "nesw-resize", "ew-resize", "nwse-resize",
+  "ns-resize", "nesw-resize", "ew-resize", "nwse-resize",
+] as const;
+
+function getRotatedCursor(handleType: HandleType, rotationDeg: number): string | null {
+  const base = HANDLE_BASE_ANGLE[handleType];
+  if (base === undefined) return null;
+  const angle = ((base + rotationDeg) % 360 + 360) % 360;
+  return CURSOR_BY_OCTANT[Math.round(angle / 45) % 8];
+}
+const HANDLE_HALF_SIZE = 0.4;
+const DEFAULT_COLORS = THEME_COLORS.light;
+
+export function createSnapIndicator(point: Point, colors?: ThemeColors): SVGCircleElement {
+  const c = colors ?? DEFAULT_COLORS;
   const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
   circle.setAttribute("cx", String(point.x));
   circle.setAttribute("cy", String(point.y));
   circle.setAttribute("r", "0.6");
-  circle.setAttribute("fill", "white");
-  circle.setAttribute("stroke", "#10b981");
+  circle.setAttribute("fill", c.handleFill);
+  circle.setAttribute("stroke", c.handleAccent);
   circle.setAttribute("stroke-width", "0.15");
   circle.style.pointerEvents = "none";
   return circle;
 }
 
-// ─── Midpoint position ────────────────────────────────────────────────────
+function createHandleCircle(handle: Handle, r: number, stroke: string, strokeWidth: number, fill?: string): SVGCircleElement {
+  const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  circle.setAttribute("cx", String(handle.x));
+  circle.setAttribute("cy", String(handle.y));
+  circle.setAttribute("r", String(r));
+  circle.setAttribute("fill", fill ?? "white");
+  circle.setAttribute("stroke", stroke);
+  circle.setAttribute("stroke-width", String(strokeWidth));
+  circle.setAttribute("data-handle", handle.type);
+  circle.style.cursor = handle.cursor;
+  return circle;
+}
 
-/** Returns the effective midpoint handle position for a line element.
- *  Uses the stored midpoint if set, otherwise computes a perpendicular offset from the line center. */
+function createHandleRect(handle: Handle, halfSize: number, stroke: string, strokeWidth: number, fill: string): SVGRectElement {
+  const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  rect.setAttribute("x", String(handle.x - halfSize));
+  rect.setAttribute("y", String(handle.y - halfSize));
+  rect.setAttribute("width", String(halfSize * 2));
+  rect.setAttribute("height", String(halfSize * 2));
+  rect.setAttribute("fill", fill);
+  rect.setAttribute("stroke", stroke);
+  rect.setAttribute("stroke-width", String(strokeWidth));
+  rect.setAttribute("data-handle", handle.type);
+  rect.style.cursor = handle.cursor;
+  return rect;
+}
+
+function createConnectorLine(x1: number, y1: number, x2: number, y2: number, accentColor?: string): SVGLineElement {
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line.setAttribute("x1", String(x1));
+  line.setAttribute("y1", String(y1));
+  line.setAttribute("x2", String(x2));
+  line.setAttribute("y2", String(y2));
+  line.setAttribute("stroke", accentColor ?? DEFAULT_COLORS.handleAccent);
+  line.setAttribute("stroke-width", "0.08");
+  line.setAttribute("stroke-dasharray", "0.3 0.2");
+  line.setAttribute("opacity", "0.6");
+  return line;
+}
+
 export function getLineMidpointPosition(el: LineElement): Point {
   if (el.midpoint) return { x: el.midpoint.x, y: el.midpoint.y };
 
@@ -41,18 +97,15 @@ export function getLineMidpointPosition(el: LineElement): Point {
 
   const dx = el.points[1].x - el.points[0].x;
   const dy = el.points[1].y - el.points[0].y;
-  const length = Math.sqrt(dx * dx + dy * dy);
+  const length = Math.hypot(dx, dy);
 
   if (length > 0.1) {
     const perpX = -dy / length;
     const perpY = dx / length;
-    const offset = 2;
-    return { x: centerX + perpX * offset, y: centerY + perpY * offset };
+    return { x: centerX + perpX * MIDPOINT_HANDLE_OFFSET, y: centerY + perpY * MIDPOINT_HANDLE_OFFSET };
   }
   return { x: centerX, y: centerY };
 }
-
-// ─── Handle positions ──────────────────────────────────────────────────────
 
 function getHandlePositions(el: DrawingElement, bboxOverride?: BoundingBox): Handle[] {
   const handles: Handle[] = [];
@@ -84,63 +137,51 @@ function getHandlePositions(el: DrawingElement, bboxOverride?: BoundingBox): Han
     const cy = bbox.y + bbox.height / 2;
     const center = { x: cx, y: cy };
 
-    const addHandle = (type: HandleType, x: number, y: number, cursor: string) => {
-      const rotatedCursor = getRotatedCursor(type, el.rotation) ?? cursor;
+    const addHandle = (type: HandleType, x: number, y: number) => {
+      const cursor = getRotatedCursor(type, el.rotation) ?? cursorForHandle[type];
       if (el.rotation !== 0) {
         const rotated = rotatePoint({ x, y }, center, el.rotation);
-        handles.push({ type, x: rotated.x, y: rotated.y, cursor: rotatedCursor });
+        handles.push({ type, x: rotated.x, y: rotated.y, cursor });
       } else {
-        handles.push({ type, x, y, cursor: rotatedCursor });
+        handles.push({ type, x, y, cursor });
       }
     };
 
-    addHandle("nw", bbox.x, bbox.y, cursorForHandle.nw);
-    addHandle("ne", bbox.x + bbox.width, bbox.y, cursorForHandle.ne);
-    addHandle("se", bbox.x + bbox.width, bbox.y + bbox.height, cursorForHandle.se);
-    addHandle("sw", bbox.x, bbox.y + bbox.height, cursorForHandle.sw);
+    addHandle("nw", bbox.x, bbox.y);
+    addHandle("ne", bbox.x + bbox.width, bbox.y);
+    addHandle("se", bbox.x + bbox.width, bbox.y + bbox.height);
+    addHandle("sw", bbox.x, bbox.y + bbox.height);
 
     if (isText(el)) {
-      // e/w only: reflow (width) resize; n/s omitted since height is content-derived
-      addHandle("e", bbox.x + bbox.width, cy, cursorForHandle.e);
-      addHandle("w", bbox.x, cy, cursorForHandle.w);
+      addHandle("e", bbox.x + bbox.width, cy);
+      addHandle("w", bbox.x, cy);
     } else {
-      addHandle("n", cx, bbox.y, cursorForHandle.n);
-      addHandle("e", bbox.x + bbox.width, cy, cursorForHandle.e);
-      addHandle("s", cx, bbox.y + bbox.height, cursorForHandle.s);
-      addHandle("w", bbox.x, cy, cursorForHandle.w);
+      addHandle("n", cx, bbox.y);
+      addHandle("e", bbox.x + bbox.width, cy);
+      addHandle("s", cx, bbox.y + bbox.height);
+      addHandle("w", bbox.x, cy);
     }
 
-    addHandle("rotation", cx, bbox.y - 3.5, cursorForHandle.rotation);
+    addHandle("rotation", cx, bbox.y - ROTATION_HANDLE_GAP);
   }
 
   return handles;
 }
 
-// ─── Hit testing ───────────────────────────────────────────────────────────
-
-export function hitTestHandle(
-  clientX: number,
-  clientY: number,
-  selectedIds: Set<string>,
-): Handle | null {
-  if (selectedIds.size === 0) return null;
+export function hitTestHandle(clientX: number, clientY: number): HandleType | null {
   const target = document.elementFromPoint(clientX, clientY) as SVGElement | null;
-  if (!target) return null;
-  const handleType = target.getAttribute("data-handle") as HandleType | null;
-  if (!handleType) return null;
-  return { type: handleType, x: 0, y: 0, cursor: cursorForHandle[handleType] };
+  return target?.getAttribute("data-handle") as HandleType | null;
 }
-
-// ─── SVG rendering ─────────────────────────────────────────────────────────
 
 export function ensureHandlesGroup(
   existing: SVGGElement | null,
   svg: SVGSVGElement | null,
-): SVGGElement {
+): SVGGElement | null {
   if (existing) return existing;
+  if (!svg) return null;
   const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
   group.setAttribute("class", "selection-handles");
-  svg?.appendChild(group);
+  svg.appendChild(group);
   return group;
 }
 
@@ -148,6 +189,30 @@ export interface RenderHandlesOptions {
   snapTarget: Point | null;
   activeHandle: HandleType | null;
   bboxOverrides?: Map<string, BoundingBox>;
+  themeColors?: ThemeColors;
+}
+
+function updateHandlePositions(group: SVGGElement, handles: Handle[]): boolean {
+  const existing = group.querySelectorAll<SVGElement>("[data-handle]");
+  if (existing.length !== handles.length) return false;
+  // Connector lines don't have data-handle — skip fast path when they're present
+  if (group.children.length !== existing.length) return false;
+  for (let i = 0; i < handles.length; i++) {
+    if (existing[i].getAttribute("data-handle") !== handles[i].type) return false;
+  }
+  for (let i = 0; i < handles.length; i++) {
+    const el = existing[i];
+    const handle = handles[i];
+    if (el.tagName === "circle") {
+      el.setAttribute("cx", String(handle.x));
+      el.setAttribute("cy", String(handle.y));
+    } else if (el.tagName === "rect") {
+      el.setAttribute("x", String(handle.x - HANDLE_HALF_SIZE));
+      el.setAttribute("y", String(handle.y - HANDLE_HALF_SIZE));
+    }
+    el.style.cursor = handle.cursor;
+  }
+  return true;
 }
 
 export function renderHandles(
@@ -155,9 +220,10 @@ export function renderHandles(
   selectedElements: DrawingElement[],
   options?: RenderHandlesOptions,
 ): void {
-  group.innerHTML = "";
-
-  if (selectedElements.length === 0) return;
+  if (selectedElements.length === 0) {
+    group.replaceChildren();
+    return;
+  }
 
   let handles: Handle[];
   if (selectedElements.length === 1) {
@@ -180,114 +246,60 @@ export function renderHandles(
       { type: "s", x: cx, y: maxY, cursor: cursorForHandle.s },
       { type: "sw", x: minX, y: maxY, cursor: cursorForHandle.sw },
       { type: "w", x: minX, y: cy, cursor: cursorForHandle.w },
-      { type: "rotation", x: cx, y: minY - 3.5, cursor: cursorForHandle.rotation },
+      { type: "rotation", x: cx, y: minY - ROTATION_HANDLE_GAP, cursor: cursorForHandle.rotation },
     ];
   }
+
+  if (updateHandlePositions(group, handles)) return;
+
+  const tc = options?.themeColors ?? DEFAULT_COLORS;
+  const children: SVGElement[] = [];
 
   for (const handle of handles) {
     if (handle.type === "rotation") {
       let topCenterX = handle.x;
-      let topCenterY = handle.y + 3.5;
+      let topCenterY = handle.y + ROTATION_HANDLE_GAP;
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
         const bbox = options?.bboxOverrides?.get(el.id) ?? getBoundingBox(el);
         const elCx = bbox.x + bbox.width / 2;
         const elCy = bbox.y + bbox.height / 2;
-        const rotatedTopCenter = rotatePoint(
-          { x: elCx, y: bbox.y },
-          { x: elCx, y: elCy },
-          el.rotation,
-        );
-        topCenterX = rotatedTopCenter.x;
-        topCenterY = rotatedTopCenter.y;
+        const rotated = rotatePoint({ x: elCx, y: bbox.y }, { x: elCx, y: elCy }, el.rotation);
+        topCenterX = rotated.x;
+        topCenterY = rotated.y;
       }
-      const connector = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      connector.setAttribute("x1", String(handle.x));
-      connector.setAttribute("y1", String(handle.y));
-      connector.setAttribute("x2", String(topCenterX));
-      connector.setAttribute("y2", String(topCenterY));
-      connector.setAttribute("stroke", "#10b981");
-      connector.setAttribute("stroke-width", "0.08");
-      connector.setAttribute("stroke-dasharray", "0.3 0.2");
-      connector.setAttribute("opacity", "0.6");
-      group.appendChild(connector);
-
-      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      circle.setAttribute("cx", String(handle.x));
-      circle.setAttribute("cy", String(handle.y));
-      circle.setAttribute("r", "0.55");
-      circle.setAttribute("fill", "white");
-      circle.setAttribute("stroke", "#10b981");
-      circle.setAttribute("stroke-width", "0.15");
-      circle.setAttribute("data-handle", handle.type);
-      circle.style.cursor = handle.cursor;
-      group.appendChild(circle);
+      children.push(createConnectorLine(handle.x, handle.y, topCenterX, topCenterY, tc.handleAccent));
+      children.push(createHandleCircle(handle, 0.55, tc.handleAccent, 0.15, tc.handleFill));
     } else if (handle.type === "midpoint") {
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
         if (isLine(el)) {
           for (const pt of el.points) {
-            const arm = document.createElementNS("http://www.w3.org/2000/svg", "line");
-            arm.setAttribute("x1", String(pt.x));
-            arm.setAttribute("y1", String(pt.y));
-            arm.setAttribute("x2", String(handle.x));
-            arm.setAttribute("y2", String(handle.y));
-            arm.setAttribute("stroke", "#10b981");
-            arm.setAttribute("stroke-width", "0.08");
-            arm.setAttribute("stroke-dasharray", "0.3 0.2");
-            arm.setAttribute("opacity", "0.6");
-            group.appendChild(arm);
+            children.push(createConnectorLine(pt.x, pt.y, handle.x, handle.y, tc.handleAccent));
           }
         }
       }
-
-      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      circle.setAttribute("cx", String(handle.x));
-      circle.setAttribute("cy", String(handle.y));
-      circle.setAttribute("r", "0.5");
-      circle.setAttribute("fill", "white");
-      circle.setAttribute("stroke", "#10b981");
-      circle.setAttribute("stroke-width", "0.15");
-      circle.setAttribute("data-handle", handle.type);
-      circle.style.cursor = handle.cursor;
-      group.appendChild(circle);
+      children.push(createHandleCircle(handle, 0.5, tc.handleAccent, 0.15, tc.handleFill));
     } else if (handle.type === "start" || handle.type === "end") {
-      let handleStroke = "#0066ff";
+      let stroke = tc.handlePrimary;
       if (selectedElements.length === 1) {
         const el = selectedElements[0];
         if (isLine(el)) {
           if ((handle.type === "start" && el.startBinding) ||
               (handle.type === "end" && el.endBinding)) {
-            handleStroke = "#10b981";
+            stroke = tc.handleAccent;
           }
         }
       }
-      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      circle.setAttribute("cx", String(handle.x));
-      circle.setAttribute("cy", String(handle.y));
-      circle.setAttribute("r", "0.45");
-      circle.setAttribute("fill", "white");
-      circle.setAttribute("stroke", handleStroke);
-      circle.setAttribute("stroke-width", "0.12");
-      circle.setAttribute("data-handle", handle.type);
-      circle.style.cursor = handle.cursor;
-      group.appendChild(circle);
+      children.push(createHandleCircle(handle, 0.45, stroke, 0.12, tc.handleFill));
     } else {
-      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      rect.setAttribute("x", String(handle.x - 0.4));
-      rect.setAttribute("y", String(handle.y - 0.4));
-      rect.setAttribute("width", "0.8");
-      rect.setAttribute("height", "0.8");
-      rect.setAttribute("fill", "white");
-      rect.setAttribute("stroke", "#0066ff");
-      rect.setAttribute("stroke-width", "0.1");
-      rect.setAttribute("data-handle", handle.type);
-      rect.style.cursor = handle.cursor;
-      group.appendChild(rect);
+      children.push(createHandleRect(handle, HANDLE_HALF_SIZE, tc.handlePrimary, 0.1, tc.handleFill));
     }
   }
 
   if (options?.snapTarget && (options.activeHandle === "start" || options.activeHandle === "end")) {
-    group.appendChild(createSnapIndicator(options.snapTarget));
+    children.push(createSnapIndicator(options.snapTarget, tc));
   }
+
+  group.replaceChildren(...children);
 }

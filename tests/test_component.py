@@ -1,9 +1,10 @@
 """Tests for DrawingCanvas component and toolbar generation."""
 
+import json
+
 from star_drawing import (
     ARROWHEAD_OPTIONS,
-    COLOR_PALETTE,
-    FILL_PALETTE,
+    DEFAULT_PALETTE,
     HIGHLIGHTER_COLORS,
     STATIC_DIR,
     TOOL_GROUPS,
@@ -11,37 +12,67 @@ from star_drawing import (
     annotation_toolbar,
     diagram_toolbar,
     drawing_toolbar,
+    palette_json,
 )
-
 
 # ---------------------------------------------------------------------------
 # Palettes and data
 # ---------------------------------------------------------------------------
 
 
-def test_color_palette_entries_have_hex_and_name():
-    for color, name in COLOR_PALETTE:
-        assert color.startswith("#"), f"{name} color should be hex"
-        assert len(name) > 0
+def test_default_palette_structure():
+    assert "stroke" in DEFAULT_PALETTE
+    assert "fill" in DEFAULT_PALETTE
+    for kind in ("stroke", "fill"):
+        for theme in ("light", "dark"):
+            entries = DEFAULT_PALETTE[kind][theme]
+            assert len(entries) >= 5, f"{kind}/{theme} palette should have at least 5 entries"
+            for color, name in entries:
+                assert color.startswith("#"), f"{kind}/{theme}: {name} color should be hex"
+                assert len(name) > 0
 
 
-def test_fill_palette_entries_have_hex_and_name():
-    for color, name in FILL_PALETTE:
-        assert color.startswith("#"), f"{name} color should be hex"
-        assert len(name) > 0
+def test_no_duplicate_colors_in_default_palette():
+    for kind in ("stroke", "fill"):
+        for theme in ("light", "dark"):
+            colors = [c for c, _ in DEFAULT_PALETTE[kind][theme]]
+            assert len(colors) == len(set(colors)), f"Duplicate colors in {kind}/{theme}"
 
 
-def test_no_duplicate_colors_in_palettes():
-    stroke_colors = [c for c, _ in COLOR_PALETTE]
-    assert len(stroke_colors) == len(set(stroke_colors)), "Duplicate stroke colors"
+def test_palette_light_dark_same_length():
+    for kind in ("stroke", "fill"):
+        light = DEFAULT_PALETTE[kind]["light"]
+        dark = DEFAULT_PALETTE[kind]["dark"]
+        assert len(light) == len(dark), f"{kind} palette light/dark length mismatch"
 
-    fill_colors = [c for c, _ in FILL_PALETTE]
-    assert len(fill_colors) == len(set(fill_colors)), "Duplicate fill colors"
+
+def test_palette_json_strips_names():
+    result = json.loads(palette_json(DEFAULT_PALETTE))
+    for kind in ("stroke", "fill"):
+        for theme in ("light", "dark"):
+            for color in result[kind][theme]:
+                assert isinstance(color, str)
+                assert color.startswith("#")
+
+
+def test_palette_json_custom():
+    custom = {
+        "stroke": {"light": [("#aaa", "A")], "dark": [("#bbb", "B")]},
+        "fill": {"light": [("#ccc", "C")], "dark": [("#ddd", "D")]},
+    }
+    result = json.loads(palette_json(custom))
+    assert result["stroke"]["light"] == ["#aaa"]
+    assert result["stroke"]["dark"] == ["#bbb"]
+    assert result["fill"]["light"] == ["#ccc"]
+    assert result["fill"]["dark"] == ["#ddd"]
+    # Verify defaults aren't leaking in
+    default_stroke = DEFAULT_PALETTE["stroke"]["light"][0][0]
+    assert default_stroke not in result["stroke"]["light"]
 
 
 def test_highlighter_colors_exist():
     assert len(HIGHLIGHTER_COLORS) >= 3
-    for color, name in HIGHLIGHTER_COLORS:
+    for color, _name in HIGHLIGHTER_COLORS:
         assert color.startswith("#")
 
 
@@ -92,6 +123,13 @@ def test_drawing_canvas_exposes_methods():
     assert canvas.redo is not None
     assert canvas.clear is not None
     assert canvas.export_svg is not None
+    assert canvas.set_theme is not None
+    assert canvas.prefetch_fonts is not None
+
+
+def test_drawing_canvas_exposes_theme_signal():
+    canvas = DrawingCanvas(name="c")
+    assert canvas.theme is not None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +179,52 @@ def test_drawing_toolbar_hide_undo():
     assert "lucide:undo-2" not in html
 
 
+def test_drawing_toolbar_file_menu():
+    canvas = DrawingCanvas(name="t")
+    toolbar = drawing_toolbar(canvas, show_file_actions=True, show_undo=False, show_colors=False, show_styles=False)
+    html = str(toolbar)
+    assert "lucide:ellipsis-vertical" in html
+    assert "lucide:folder-open" in html
+    assert "lucide:download" in html
+    assert "Open SVG" in html  # no ellipsis — modern style
+    assert "Save SVG" in html
+    assert "t-svg-import" in html  # hidden file input ID
+    assert "t-file-panel" in html  # popover panel ID
+
+
+def test_drawing_toolbar_file_menu_default_on():
+    canvas = DrawingCanvas(name="t")
+    toolbar = drawing_toolbar(canvas)
+    html = str(toolbar)
+    assert "lucide:ellipsis-vertical" in html
+    assert "file-menu" in html
+
+
+def test_drawing_toolbar_hide_file_actions():
+    canvas = DrawingCanvas(name="t")
+    toolbar = drawing_toolbar(canvas, show_file_actions=False)
+    html = str(toolbar)
+    assert "lucide:ellipsis-vertical" not in html
+    assert "file-menu" not in html
+
+
+def test_drawing_toolbar_file_menu_export_js():
+    canvas = DrawingCanvas(name="demo")
+    toolbar = drawing_toolbar(canvas, show_file_actions=True, show_undo=False, show_colors=False, show_styles=False)
+    html = str(toolbar)
+    assert "$demo.exportSvg()" in html
+    assert ".then(svg" in html  # async via .then() (Datastar doesn't support await)
+    assert "drawing.svg" in html  # download filename
+
+
+def test_drawing_toolbar_file_menu_import_js():
+    canvas = DrawingCanvas(name="demo")
+    toolbar = drawing_toolbar(canvas, show_file_actions=True, show_undo=False, show_colors=False, show_styles=False)
+    html = str(toolbar)
+    assert "$demo.importSvg(text)" in html
+    assert ".svg,image/svg+xml" in html  # file accept filter
+
+
 def test_drawing_toolbar_color_panel():
     canvas = DrawingCanvas(name="t")
     toolbar = drawing_toolbar(canvas, show_colors=True, show_styles=False)
@@ -151,8 +235,17 @@ def test_drawing_toolbar_color_panel():
 
 def test_drawing_toolbar_custom_palette():
     canvas = DrawingCanvas(name="t")
-    custom = [("#ff0000", "Red"), ("#00ff00", "Green")]
-    toolbar = drawing_toolbar(canvas, color_palette=custom, show_styles=False)
+    custom = {
+        "stroke": {
+            "light": [("#ff0000", "Red"), ("#00ff00", "Green")],
+            "dark": [("#ff6666", "Light Red"), ("#66ff66", "Light Green")],
+        },
+        "fill": {
+            "light": [("#ffffff", "White")],
+            "dark": [("#333333", "Dark")],
+        },
+    }
+    toolbar = drawing_toolbar(canvas, palette=custom, show_styles=False)
     html = str(toolbar)
     assert "#ff0000" in html
     assert "#00ff00" in html
@@ -164,6 +257,14 @@ def test_drawing_toolbar_style_panel():
     html = str(toolbar)
     assert "lucide:sliders-horizontal" in html
     assert "style-btn" in html
+
+
+def test_drawing_toolbar_uses_palette_tokens():
+    canvas = DrawingCanvas(name="t")
+    toolbar = drawing_toolbar(canvas, show_styles=False)
+    html = str(toolbar)
+    assert "palette-stroke-0" in html
+    assert "palette-fill-0" in html
 
 
 # ---------------------------------------------------------------------------

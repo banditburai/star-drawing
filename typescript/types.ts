@@ -1,5 +1,20 @@
 export type ArrowheadStyle = "none" | "arrow" | "triangle" | "circle" | "bar" | "diamond";
 
+export type Theme = "light" | "dark";
+
+export interface PaletteData {
+  stroke: Record<Theme, string[]>;
+  fill: Record<Theme, string[]>;
+}
+
+export interface ThemeColors {
+  highlightStroke: string;
+  canvasBackground: string;
+  handleFill: string;
+  handlePrimary: string;
+  handleAccent: string;
+}
+
 export type Tool =
   | "select"
   | "pen"
@@ -15,7 +30,7 @@ export type Tool =
 export type Layer = "background" | "default" | "foreground";
 
 export interface Point {
-  x: number; // 0-100 percentage
+  x: number;
   y: number;
 }
 
@@ -26,7 +41,7 @@ export interface BoundingBox {
   height: number;
 }
 
-/** Map from element ID → measured bounding box. Used to override text approximation with SVG getBBox() results. */
+/** Overrides text-size approximation with SVG getBBox() measurements. */
 export type TextBoundsMap = ReadonlyMap<string, BoundingBox>;
 
 export interface BaseElement {
@@ -35,12 +50,12 @@ export interface BaseElement {
   layer: Layer;
   stroke_color: string;
   stroke_width: number;
-  dash_length: number; // 0 = solid/dotted, >=1 = dashed (viewBox units before scaling)
-  dash_gap: number;    // 0 = solid (when dash_length also 0), >0 = gap between dashes/dots
+  dash_length: number;
+  dash_gap: number;
   fill_color: string;
   opacity: number;
   created_at: number;
-  rotation: number; // degrees, default 0
+  rotation: number;
 }
 
 export interface PathElement extends BaseElement {
@@ -53,14 +68,20 @@ export interface LineElement extends BaseElement {
   points: [Point, Point];
   start_arrowhead: ArrowheadStyle;
   end_arrowhead: ArrowheadStyle;
-  midpoint?: Point | undefined; // Optional bezier control point for curved lines
+  midpoint?: Point | undefined;
   startBinding?: Binding | undefined;
   endBinding?: Binding | undefined;
 }
 
 export interface Binding {
-  elementId: string;       // ID of the bound shape
-  anchor: Point;           // Normalized 0-1 within shape's bounding box
+  elementId: string;
+  anchor: Point;
+}
+
+export interface SnapResult {
+  point: Point;
+  elementId?: string;
+  anchor?: Point;
 }
 
 export interface ShapeElement extends BaseElement {
@@ -79,7 +100,7 @@ export interface TextElement extends BaseElement {
   font_size: number;
   font_family: "hand-drawn" | "normal" | "monospace";
   text_align: "left" | "center" | "right";
-  width?: number | undefined; // If set, text wraps at this width (viewBox units)
+  width?: number | undefined;
 }
 
 export type DrawingElement = PathElement | LineElement | ShapeElement | TextElement;
@@ -92,6 +113,23 @@ export const isPath = (el: DrawingElement): el is PathElement =>
   el.type === "pen" || el.type === "highlighter";
 export const isText = (el: DrawingElement): el is TextElement =>
   el.type === "text";
+
+export function cloneElement<T extends DrawingElement>(el: T): T {
+  if ("points" in el) {
+    const clone = {
+      ...el,
+      points: (el.points as Point[]).map((p) => ({ ...p })),
+    } as T;
+    if (isLine(el)) {
+      const lineClone = clone as T & { midpoint?: Point; startBinding?: Binding; endBinding?: Binding };
+      if (lineClone.midpoint) lineClone.midpoint = { ...lineClone.midpoint };
+      if (lineClone.startBinding) lineClone.startBinding = { ...lineClone.startBinding, anchor: { ...lineClone.startBinding.anchor } };
+      if (lineClone.endBinding) lineClone.endBinding = { ...lineClone.endBinding, anchor: { ...lineClone.endBinding.anchor } };
+    }
+    return clone;
+  }
+  return { ...el } as T;
+}
 
 export type HandleType =
   | "nw"
@@ -137,13 +175,17 @@ export interface DrawingConfig {
   readonly?: boolean;
   viewBoxWidth: number;
   viewBoxHeight: number;
+  fontEmbedUrls?: Record<string, string>;
+  palette?: PaletteData;
+  theme?: Theme;
 }
 
-export type ResizeHandleType = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
+export type ResizeHandleType = Exclude<HandleType, "rotation" | "start" | "end" | "midpoint">;
 
 export type StyleProperty =
   | "stroke_color"
   | "fill_color"
+  | "fill_enabled"
   | "stroke_width"
   | "opacity"
   | "dash_length"
@@ -151,9 +193,8 @@ export type StyleProperty =
   | "start_arrowhead"
   | "end_arrowhead";
 
-export type MovePosition = { x: number; y: number } | { points: Point[]; midpoint?: Point | undefined };
+export type MovePosition = Point | { points: Point[]; midpoint?: Point | undefined };
 
-// Typed contract between TypeScript controller and Datastar signals
 export interface DrawingState {
   tool: Tool;
   is_drawing: boolean;
@@ -176,6 +217,8 @@ export interface DrawingState {
   end_arrowhead: ArrowheadStyle;
   selected_is_line: boolean;
   selected_is_text: boolean;
+  selected_is_highlighter: boolean;
+  theme: Theme;
 }
 
 export interface GroupResizeState {
@@ -206,9 +249,8 @@ export type ElementChangeEvent =
   | { type: "reorder"; order: string[] };
 
 export type UndoAction =
-  | { action: "add"; data: DrawingElement }
-  | { action: "remove"; data: DrawingElement }
-  | { action: "remove_batch"; data: DrawingElement[] }
+  | { action: "add"; data: DrawingElement[] }
+  | { action: "remove"; data: DrawingElement[] }
   | {
       action: "move";
       data: Array<{

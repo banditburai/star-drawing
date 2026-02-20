@@ -1,11 +1,10 @@
-import { cloneElement } from "./geometry.js";
 import type {
   DrawingElement,
   MovePosition,
   Point,
   UndoAction,
 } from "./types.js";
-import { isLine, isPath, isShape, isText } from "./types.js";
+import { cloneElement, isLine, isPath, isShape, isText } from "./types.js";
 
 // The MovePosition discriminant ("x" vs "points") must match the element type.
 function applyMovePosition(el: DrawingElement, pos: MovePosition): void {
@@ -39,22 +38,16 @@ export function processHistory(
 
   switch (action.action) {
     case "add":
-      if (isUndo) {
-        result.elementsToDelete.push(action.data.id);
-      } else {
-        result.elementsToSet.push([action.data.id, action.data]);
+      for (const el of action.data) {
+        if (isUndo) {
+          result.elementsToDelete.push(el.id);
+        } else {
+          result.elementsToSet.push([el.id, el]);
+        }
       }
       break;
 
     case "remove":
-      if (isUndo) {
-        result.elementsToSet.push([action.data.id, action.data]);
-      } else {
-        result.elementsToDelete.push(action.data.id);
-      }
-      break;
-
-    case "remove_batch":
       for (const el of action.data) {
         if (isUndo) {
           result.elementsToSet.push([el.id, el]);
