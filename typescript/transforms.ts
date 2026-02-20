@@ -1,6 +1,5 @@
 import {
   getBoundingBox,
-  getElementCenter,
   rotatePoint,
 } from "./geometry.js";
 import type {
@@ -8,7 +7,6 @@ import type {
   DrawingElement,
   GroupResizeState,
   GroupRotationState,
-  HandleType,
   LineElement,
   PathElement,
   Point,
@@ -27,8 +25,6 @@ function remapPoints(points: Point[], oldBounds: BoundingBox, newBounds: Boundin
   }));
 }
 
-// ─── Resize ────────────────────────────────────────────────────────────────
-
 export interface ResizeOptions {
   handleType: ResizeHandleType;
   startBounds: BoundingBox;
@@ -39,22 +35,10 @@ export interface ResizeOptions {
   resizeFromCenter: boolean;
 }
 
-/**
- * Get the fixed corner in local (unrotated) space for a given handle.
- *
- * CORNER handles (nw/ne/se/sw): the diagonally opposite corner.
- *
- * EDGE handles (n/s/e/w): a corner on the fixed (opposite) edge.
- * This is the "corner-pair decomposition" — every edge drag is reduced
- * to a pair of diagonally-opposite corners so the same Preet Shihn
- * unrotate maths can be applied uniformly. Using a true corner (not an
- * edge midpoint) ensures the pair always spans both axes, avoiding the
- * single-axis collapse that breaks the original midpoint algorithm.
- */
-function getFixedCorner(
-  handleType: HandleType,
-  bounds: BoundingBox,
-): Point {
+// Corner-pair decomposition: edge handles use a full corner (not the midpoint)
+// so the pair spans both axes — midpoints collapse single-axis and break the
+// Preet Shihn unrotate maths.
+function getFixedCorner(handleType: ResizeHandleType, bounds: BoundingBox): Point {
   const { x, y, width, height } = bounds;
   switch (handleType) {
     case "nw": return { x: x + width, y: y + height };
@@ -65,32 +49,22 @@ function getFixedCorner(
     case "s":  return { x, y };
     case "e":  return { x, y };
     case "w":  return { x: x + width, y };
-    default:   return { x: x + width / 2, y: y + height / 2 };
   }
 }
 
-/**
- * Rotation-aware resize using the "corner-pair" approach.
- *
- * Every resize — whether from a corner or an edge handle — is reduced
- * to two diagonally-opposite corners in screen space so the Preet Shihn
- * algorithm can be applied uniformly.
- *
- * Step 1: Rotate screen delta into element-local space.
- * Step 2: Apply local delta per handle to the relevant edges.
- * Step 3: Drift compensation — pin the fixed corner in screen space.
- */
+// Rotation-aware resize using the Preet Shihn "corner-pair" approach:
+// every resize is reduced to two diagonally-opposite corners in screen
+// space so the same unrotate maths applies uniformly.
 export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
   const { handleType, startBounds, dx, dy, rotation, maintainAspectRatio, resizeFromCenter } = opts;
 
-  // ── Step 1: Rotate screen delta into local (unrotated) space ──
+  // Rotate screen delta into element-local (unrotated) space
   const rad = (-rotation * Math.PI) / 180;
   const cosR = Math.cos(rad);
   const sinR = Math.sin(rad);
   const localDx = dx * cosR - dy * sinR;
   const localDy = dx * sinR + dy * cosR;
 
-  // ── Step 2: Apply local delta per handle ──
   let { x, y, width, height } = startBounds;
 
   switch (handleType) {
@@ -130,7 +104,6 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
       break;
   }
 
-  // ── Maintain aspect ratio ──
   if (maintainAspectRatio && startBounds.width > 0 && startBounds.height > 0) {
     const aspect = startBounds.width / startBounds.height;
     const isVerticalOnly  = handleType === "n" || handleType === "s";
@@ -154,9 +127,10 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
     const dw = targetW - width;
     const dh = targetH - height;
 
+    // Shift origin so the opposite edge stays fixed when growing toward the handle
     if (handleType.includes("w"))  x -= dw;
     if (handleType.includes("n"))  y -= dh;
-
+    // Single-axis handles center the growth on the perpendicular axis
     if (isVerticalOnly)   x -= dw / 2;
     if (isHorizontalOnly) y -= dh / 2;
 
@@ -164,7 +138,7 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
     height = targetH;
   }
 
-  // ── Resize from center (Alt key) — center stays fixed ──
+  // Alt key: keep the original center fixed
   if (resizeFromCenter) {
     const origCenter: Point = {
       x: startBounds.x + startBounds.width / 2,
@@ -180,7 +154,6 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
     };
   }
 
-  // ── Enforce minimum size ──
   if (width < 1) {
     if (handleType.includes("w")) x += width - 1;
     width = 1;
@@ -190,8 +163,7 @@ export function calculateResizeBounds(opts: ResizeOptions): BoundingBox {
     height = 1;
   }
 
-  // ── Step 3: Drift compensation (corner-pair invariant) ──
-  // The fixed corner must stay at the same screen position.
+  // Drift compensation: pin the fixed corner at its screen position
   if (rotation !== 0) {
     const oldCenter: Point = {
       x: startBounds.x + startBounds.width / 2,
@@ -222,11 +194,6 @@ function positionTextInBounds(el: TextElement, bounds: BoundingBox): void {
   }
 }
 
-/**
- * Apply new bounds to an element, scaling text font size and remapping line/path points.
- * Used for both single-element resize (interactive) and group resize (per-element).
- * @param originalFontSize - Override for text base font size (interactive resize tracks this separately)
- */
 export function applyResize(
   element: DrawingElement,
   newBounds: BoundingBox,
@@ -249,10 +216,10 @@ export function applyResize(
       element.width = originalElement.width * scaleX;
     }
     positionTextInBounds(element, newBounds);
-  } else if (isLine(element)) {
-    element.points = remapPoints((originalElement as LineElement).points, startBounds, newBounds) as [Point, Point];
-  } else if (isPath(element)) {
-    element.points = remapPoints((originalElement as PathElement).points, startBounds, newBounds);
+  } else if (isLine(element) && isLine(originalElement)) {
+    element.points = remapPoints(originalElement.points, startBounds, newBounds) as [Point, Point];
+  } else if (isPath(element) && isPath(originalElement)) {
+    element.points = remapPoints(originalElement.points, startBounds, newBounds);
   }
 }
 
@@ -288,8 +255,6 @@ export function applyGroupResize(
   }
 }
 
-// ─── Rotation ──────────────────────────────────────────────────────────────
-
 function setElementPosition(el: DrawingElement, newPos: Point, textBounds?: TextBoundsMap): void {
   if (isShape(el)) {
     const bbox = getBoundingBox(el, textBounds);
@@ -303,32 +268,14 @@ function setElementPosition(el: DrawingElement, newPos: Point, textBounds?: Text
       width: bbox.width,
       height: bbox.height,
     });
-  } else if (isLine(el)) {
+  } else if (isLine(el) || isPath(el)) {
     const bbox = getBoundingBox(el);
-    const oldCenterX = bbox.x + bbox.width / 2;
-    const oldCenterY = bbox.y + bbox.height / 2;
-    const dx = newPos.x - oldCenterX;
-    const dy = newPos.y - oldCenterY;
-    el.points = el.points.map((p) => ({
-      x: p.x + dx,
-      y: p.y + dy,
-    })) as [Point, Point];
-    if (el.midpoint) {
-      el.midpoint = {
-        x: el.midpoint.x + dx,
-        y: el.midpoint.y + dy,
-      };
+    const dx = newPos.x - (bbox.x + bbox.width / 2);
+    const dy = newPos.y - (bbox.y + bbox.height / 2);
+    el.points = el.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) as typeof el.points;
+    if (isLine(el) && el.midpoint) {
+      el.midpoint = { x: el.midpoint.x + dx, y: el.midpoint.y + dy };
     }
-  } else if (isPath(el)) {
-    const bbox = getBoundingBox(el);
-    const oldCenterX = bbox.x + bbox.width / 2;
-    const oldCenterY = bbox.y + bbox.height / 2;
-    const dx = newPos.x - oldCenterX;
-    const dy = newPos.y - oldCenterY;
-    el.points = el.points.map((p) => ({
-      x: p.x + dx,
-      y: p.y + dy,
-    }));
   }
 }
 
@@ -345,19 +292,17 @@ export function applyGroupRotation(
     const el = elements.get(item.id);
     if (!el) continue;
 
-    if (isLine(el)) {
-      const origLine = item.originalElement as LineElement;
+    if (isLine(el) && isLine(item.originalElement)) {
       el.points = [
-        rotatePoint(origLine.points[0], center, deltaAngle),
-        rotatePoint(origLine.points[1], center, deltaAngle),
+        rotatePoint(item.originalElement.points[0], center, deltaAngle),
+        rotatePoint(item.originalElement.points[1], center, deltaAngle),
       ];
-      if (origLine.midpoint) {
-        el.midpoint = rotatePoint(origLine.midpoint, center, deltaAngle);
+      if (item.originalElement.midpoint) {
+        el.midpoint = rotatePoint(item.originalElement.midpoint, center, deltaAngle);
       }
       el.rotation = 0;
-    } else if (isPath(el)) {
-      const origPath = item.originalElement as PathElement;
-      el.points = origPath.points.map((p) => rotatePoint(p, center, deltaAngle));
+    } else if (isPath(el) && isPath(item.originalElement)) {
+      el.points = item.originalElement.points.map((p) => rotatePoint(p, center, deltaAngle));
       el.rotation = 0;
     } else {
       const newPos = rotatePoint(item.position, center, deltaAngle);

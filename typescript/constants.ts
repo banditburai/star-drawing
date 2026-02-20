@@ -1,6 +1,27 @@
-import type { DrawingConfig, HandleType, Tool, ToolSettings } from "./types.js";
+import type { DrawingConfig, HandleType, TextElement, Theme, ThemeColors, Tool, ToolSettings } from "./types.js";
+import { DEFAULT_STROKE_TOKEN } from "./palette.js";
 
-// solid: both 0, dashed: length 6 + gap 0 (auto-derived), dotted: length 0 + gap 5
+export const DEFAULT_FONT_EMBED_URLS: Record<string, string> = {
+  "hand-drawn": "https://fonts.googleapis.com/css2?family=Shantell+Sans:wght@400&display=swap",
+};
+
+export const THEME_COLORS: Record<Theme, ThemeColors> = {
+  light: {
+    highlightStroke: "#ffff00",
+    canvasBackground: "#ffffff",
+    handleFill: "#ffffff",
+    handlePrimary: "#0066ff",
+    handleAccent: "#10b981",
+  },
+  dark: {
+    highlightStroke: "#ffe066",
+    canvasBackground: "#1e1e2e",
+    handleFill: "#2a2a3e",
+    handlePrimary: "#4d94ff",
+    handleAccent: "#34d399",
+  },
+};
+
 export const DASH_PRESETS: Record<string, { dash_length: number; dash_gap: number }> = {
   solid: { dash_length: 0, dash_gap: 0 },
   dashed: { dash_length: 6, dash_gap: 0 },
@@ -22,57 +43,67 @@ export const cursorForHandle: Record<HandleType, string> = {
   midpoint: "move",
 };
 
-export const fontFamilyMap: Record<string, string> = {
+export const fontFamilyMap: Record<TextElement["font_family"], string> = {
   "hand-drawn": '"Shantell Sans", "Caveat", cursive, sans-serif',
   normal: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
   monospace: 'ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
 };
 
-// viewBox percentage values
-export const fontSizeMap: Record<string, number> = {
+export const fontSizeMap: Record<"small" | "medium" | "large", number> = {
   small: 3,
   medium: 4,
   large: 6,
 };
 
-// Derived inverse lookup: font size → preset name
 export const reverseFontSizeMap: Record<number, string> = Object.fromEntries(
   Object.entries(fontSizeMap).map(([k, v]) => [v, k]),
 );
 
-export const textAnchorMap: Record<string, string> = {
+export const textAnchorMap: Record<TextElement["text_align"], string> = {
   left: "start",
   center: "middle",
   right: "end",
 };
 
+// stroke_color intentionally excluded: it persists globally across tools so switching
+// between pen/line/rect/etc keeps whatever color the user chose.  Only tools that need
+// a *different* default (highlighter → yellow, text → ink) override it explicitly.
+const BASE = { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0 } as const;
+
 export const TOOL_DEFAULTS = {
-  pen: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0 },
-  highlighter: { stroke_width: 10, opacity: 0.4, dash_length: 0, dash_gap: 0 },
-  line: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0, start_arrowhead: "none" as const, end_arrowhead: "none" as const },
-  arrow: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0, start_arrowhead: "none" as const, end_arrowhead: "arrow" as const },
-  rect: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0 },
-  ellipse: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0 },
-  diamond: { stroke_width: 2, opacity: 1, dash_length: 0, dash_gap: 0 },
-  text: { opacity: 1 },
+  pen: { ...BASE },
+  highlighter: { ...BASE, stroke_width: 4, opacity: 0.4, stroke_color: THEME_COLORS.light.highlightStroke },
+  line: { ...BASE, start_arrowhead: "none", end_arrowhead: "none" },
+  arrow: { ...BASE, start_arrowhead: "none", end_arrowhead: "arrow" },
+  rect: { ...BASE },
+  ellipse: { ...BASE },
+  diamond: { ...BASE },
+  text: { opacity: 1, stroke_color: DEFAULT_STROKE_TOKEN },
   select: {},
   eraser: { stroke_width: 5 },
 } satisfies Record<Tool, ToolSettings>;
 
+export function getToolDefaults(theme: Theme): Record<Tool, ToolSettings> {
+  const colors = THEME_COLORS[theme];
+  return {
+    ...TOOL_DEFAULTS,
+    highlighter: { ...TOOL_DEFAULTS.highlighter, stroke_color: colors.highlightStroke },
+  };
+}
+
 export const DEFAULT_CONFIG: DrawingConfig = {
   signal: "drawing",
-  defaultStrokeColor: "#000000",
-  defaultFillColor: "#ffffff",
+  defaultStrokeColor: DEFAULT_STROKE_TOKEN,
+  defaultFillColor: "",
   defaultStrokeWidth: 2,
   defaultOpacity: 1,
   defaultTool: "pen",
   defaultLayer: "default",
-  throttleMs: 8,
+  throttleMs: 16,
   viewBoxWidth: 100,
   viewBoxHeight: 100,
 };
 
-// viewBox units, 0-100 coordinate space
 export const SNAP_THRESHOLD = 1.5;
 export const TEXT_MARGIN_VB = 2;
 export const MIN_TEXT_WIDTH_VB = 10;
