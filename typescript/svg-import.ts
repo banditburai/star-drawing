@@ -7,6 +7,7 @@ import type {
   Layer,
   Point,
   TextElement,
+  Theme,
 } from "./types.js";
 
 const attrNum = (el: Element, attr: string, fallback = 0) =>
@@ -77,7 +78,12 @@ const lineProps = (src: Element, defaultEndArrowhead: ArrowheadStyle = "none") =
   endBinding: parseBinding(src, "data-end-binding"),
 });
 
-export function parseSvgToElements(svg: string): DrawingElement[] | null {
+export interface SvgImportResult {
+  elements: DrawingElement[];
+  theme?: Theme;
+}
+
+export function parseSvgToElements(svg: string): SvgImportResult | null {
   const parser = new DOMParser();
   const doc = parser.parseFromString(svg, "image/svg+xml");
 
@@ -89,6 +95,8 @@ export function parseSvgToElements(svg: string): DrawingElement[] | null {
 
   const svgEl = doc.querySelector("svg");
   if (!svgEl) return null;
+
+  const theme = svgEl.getAttribute("data-theme") as Theme | null;
 
   const elements: DrawingElement[] = [];
   const elementsGroup = svgEl.querySelector(".elements") || svgEl;
@@ -220,5 +228,5 @@ export function parseSvgToElements(svg: string): DrawingElement[] | null {
     }
   }
 
-  return elements;
+  return { elements, ...(theme && { theme }) };
 }

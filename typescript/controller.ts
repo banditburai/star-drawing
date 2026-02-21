@@ -48,7 +48,6 @@ import type {
   ShapeElement,
   SnapResult,
   StyleProperty,
-  TextBoundsMap,
   TextElement,
   Theme,
   Tool,
@@ -270,7 +269,6 @@ export class DrawingController {
       return;
     }
 
-    // Match viewBox width to container aspect ratio so the canvas fills the viewport
     const rect = this.svg.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
       const h = this.config.viewBoxHeight;
@@ -345,8 +343,11 @@ export class DrawingController {
       if (key === "y")                { e.preventDefault(); this.redo(); return; }
       if (key === "a")                { e.preventDefault(); this.selectAll(); return; }
       if (key === "d")                { e.preventDefault(); this.duplicateSelected(); return; }
-      if (key === "]")                { e.preventDefault(); this.bringToFront(); return; }
-      if (key === "[")                { e.preventDefault(); this.sendToBack(); return; }
+      // e.code for bracket keys: e.key changes with Shift (] -> }), but we need Shift as a modifier
+      if (e.code === "BracketRight" && e.shiftKey) { e.preventDefault(); this.bringToFront(); return; }
+      if (e.code === "BracketRight")               { e.preventDefault(); this.bringForward(); return; }
+      if (e.code === "BracketLeft" && e.shiftKey)  { e.preventDefault(); this.sendToBack(); return; }
+      if (e.code === "BracketLeft")                { e.preventDefault(); this.sendBackward(); return; }
       return;
     }
     if (e.altKey) return;
@@ -364,6 +365,7 @@ export class DrawingController {
       this.textEdit.commitFn();
       return;
     }
+    if (e.button !== 0) return;
 
     this.updateSvgRect();
     const tool = this.currentTool;
@@ -651,12 +653,7 @@ export class DrawingController {
         width: needsWrap ? maxWidthVB : undefined,
       };
 
-      this.elements.set(textElement.id, textElement);
-      const svgEl = this.renderElement(textElement);
-      if (svgEl && this.elementsGroup) {
-        this.elementsGroup.appendChild(svgEl);
-      }
-
+      this.insertElement(textElement);
       this.pushUndo({ action: "add", data: [textElement] });
 
       this.switchTool("select");
@@ -1242,8 +1239,25 @@ export class DrawingController {
           changes.push({ type: "update", element: cloneElement(item.after) });
         }
         break;
+      case "reorder":
+        changes.push({ type: "reorder", order: action.after });
+        break;
     }
     this.emitChanges(changes);
+  }
+
+  // Background-layer elements default behind other content; the user can still reorder freely.
+  private insertElement(el: DrawingElement): void {
+    const svgEl = this.renderElement(el);
+    if (el.layer === "background") {
+      this.elements = new Map([[el.id, el], ...this.elements]);
+      if (svgEl && this.elementsGroup) {
+        this.elementsGroup.insertBefore(svgEl, this.elementsGroup.firstChild);
+      }
+    } else {
+      this.elements.set(el.id, el);
+      if (svgEl && this.elementsGroup) this.elementsGroup.appendChild(svgEl);
+    }
   }
 
   private renderElement(el: DrawingElement): SVGElement | null {
@@ -1394,7 +1408,7 @@ export class DrawingController {
       selected_is_text: hasText,
       selected_is_highlighter: hasHighlighter,
     });
-    this.updateSelectionVisual();
+    this.renderHandles();
   }
 
   destroy(): void {
@@ -1549,11 +1563,7 @@ export class DrawingController {
   }
 
   addElement(el: DrawingElement): string {
-    this.elements.set(el.id, el);
-    const svgEl = this.renderElement(el);
-    if (svgEl && this.elementsGroup) {
-      this.elementsGroup.appendChild(svgEl);
-    }
+    this.insertElement(el);
     this.pushUndo({ action: "add", data: [el] });
     return el.id;
   }
@@ -1635,38 +1645,26 @@ export class DrawingController {
     clone.querySelector(".selection-handles")?.remove();
 
     clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("data-theme", this.state.theme);
     clone.removeAttribute("class");
     clone.removeAttribute("style");
     clone.removeAttribute("preserveAspectRatio");
+    clone.removeAttribute("width");
+    clone.removeAttribute("height");
 
-    const allElements = Array.from(this.elements.values());
-    if (allElements.length > 0 && this.elementsGroup) {
-      // Use SVG DOM getBBox for accurate bounds (accounts for bezier curves, text, etc.)
-      const rendered = this.elementsGroup.getBBox();
-      // getBBox is fill-only — add uniform margin for stroke + padding
-      let maxSW = 0;
-      for (const el of allElements) maxSW = Math.max(maxSW, el.stroke_width ?? 0);
-      const margin = maxSW / 2 + 1;
-      const vbX = rendered.x - margin;
-      const vbY = rendered.y - margin;
-      const vbW = rendered.width + margin * 2;
-      const vbH = rendered.height + margin * 2;
-      clone.setAttribute("viewBox", `${vbX} ${vbY} ${vbW} ${vbH}`);
-      clone.removeAttribute("width");
-      clone.removeAttribute("height");
+    const vb = `0 0 ${this.config.viewBoxWidth} ${this.config.viewBoxHeight}`;
+    clone.setAttribute("viewBox", vb);
 
-      const theme = this.state.theme;
-      if (theme === "dark") {
-        const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-        bg.setAttribute("x", String(vbX));
-        bg.setAttribute("y", String(vbY));
-        bg.setAttribute("width", String(vbW));
-        bg.setAttribute("height", String(vbH));
-        bg.setAttribute("fill", THEME_COLORS.dark.canvasBackground);
-        // Insert before .elements group so it's a background, not an importable element
-        const elementsG = clone.querySelector(".elements");
-        if (elementsG) clone.insertBefore(bg, elementsG);
-      }
+    const theme = this.state.theme;
+    if (theme === "dark") {
+      const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      bg.setAttribute("x", "0");
+      bg.setAttribute("y", "0");
+      bg.setAttribute("width", String(this.config.viewBoxWidth));
+      bg.setAttribute("height", String(this.config.viewBoxHeight));
+      bg.setAttribute("fill", THEME_COLORS.dark.canvasBackground);
+      const elementsG = clone.querySelector(".elements");
+      if (elementsG) clone.insertBefore(bg, elementsG);
     }
 
     if (fontStyleCSS) {
@@ -1703,15 +1701,19 @@ export class DrawingController {
   }
 
   importSvg(svg: string): void {
-    const elements = parseSvgToElements(svg);
-    if (!elements) return;
+    const result = parseSvgToElements(svg);
+    if (!result) return;
+
+    if (result.theme && result.theme !== this.state.theme) {
+      this.setTheme(result.theme);
+    }
 
     this.elements.clear();
     this.selectedIds.clear();
     this.undoStack = [];
     this.redoStack = [];
 
-    for (const el of elements) this.elements.set(el.id, el);
+    for (const el of result.elements) this.elements.set(el.id, el);
 
     this.rerenderElements();
     this.setState({
@@ -1810,9 +1812,7 @@ export class DrawingController {
       };
     }
 
-    this.elements.set(element.id, element);
-    const svgEl = this.renderElement(element);
-    if (svgEl) this.elementsGroup.appendChild(svgEl);
+    this.insertElement(element);
 
     this.pushUndo({ action: "add", data: [element] });
     this.clearPreview();
@@ -1858,10 +1858,6 @@ export class DrawingController {
     }
 
     this.setState(patch);
-    this.updateSelectionVisual();
-  }
-
-  private updateSelectionVisual(): void {
     this.renderHandles();
   }
 
@@ -1875,6 +1871,14 @@ export class DrawingController {
     const result = processHistory(action, this.elements, direction);
     for (const id of result.elementsToDelete) this.elements.delete(id);
     for (const [id, el] of result.elementsToSet) this.elements.set(id, el);
+    if (result.orderToApply) {
+      const newMap = new Map<string, DrawingElement>();
+      for (const id of result.orderToApply) {
+        const el = this.elements.get(id);
+        if (el) newMap.set(id, el);
+      }
+      this.elements = newMap;
+    }
     toStack.push(action);
 
     const changes: ElementChangeEvent[] = [];
@@ -1884,6 +1888,9 @@ export class DrawingController {
     for (const [id, el] of result.elementsToSet) {
       const eventType = existingIds.has(id) ? "update" : "create";
       changes.push({ type: eventType, element: cloneElement(el) });
+    }
+    if (result.orderToApply) {
+      changes.push({ type: "reorder", order: result.orderToApply });
     }
     this.emitChanges(changes);
 
@@ -1977,7 +1984,7 @@ export class DrawingController {
     for (const id of newIds) this.selectedIds.add(id);
 
     this.setState({ selected_ids: newIds });
-    this.updateSelectionVisual();
+    this.renderHandles();
   }
 
   private nudgeSelected(dx: number, dy: number): void {
@@ -2083,42 +2090,73 @@ export class DrawingController {
     return duplicates;
   }
 
+  private commitReorder(previousOrder: string[]): void {
+    const newOrder = [...this.elements.keys()];
+    this.pushUndo({ action: "reorder", before: previousOrder, after: newOrder });
+    this.rerenderElements();
+  }
+
   bringToFront(): void {
     if (this.selectedIds.size === 0) return;
-
+    const previousOrder = [...this.elements.keys()];
     const selected: DrawingElement[] = [];
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
-      if (el) {
-        selected.push(el);
-        this.elements.delete(id);
-      }
+      if (el) { selected.push(el); this.elements.delete(id); }
     }
-    for (const el of selected) {
-      this.elements.set(el.id, el);
-    }
-
-    this.emitChanges([{ type: "reorder", order: [...this.elements.keys()] }]);
-    this.rerenderElements();
+    for (const el of selected) this.elements.set(el.id, el);
+    const newOrder = [...this.elements.keys()];
+    if (previousOrder.every((id, i) => id === newOrder[i])) return;
+    this.commitReorder(previousOrder);
   }
 
   sendToBack(): void {
     if (this.selectedIds.size === 0) return;
-
+    const previousOrder = [...this.elements.keys()];
     const newMap = new Map<string, DrawingElement>();
     for (const id of this.selectedIds) {
       const el = this.elements.get(id);
       if (el) newMap.set(id, el);
     }
     for (const [id, el] of this.elements) {
-      if (!this.selectedIds.has(id)) {
-        newMap.set(id, el);
-      }
+      if (!this.selectedIds.has(id)) newMap.set(id, el);
     }
     this.elements = newMap;
+    const newOrder = [...this.elements.keys()];
+    if (previousOrder.every((id, i) => id === newOrder[i])) return;
+    this.commitReorder(previousOrder);
+  }
 
-    this.emitChanges([{ type: "reorder", order: [...this.elements.keys()] }]);
-    this.rerenderElements();
+  bringForward(): void {
+    if (this.selectedIds.size === 0) return;
+    const previousOrder = [...this.elements.keys()];
+    const entries = [...this.elements.entries()];
+    let swapped = false;
+    for (let i = entries.length - 2; i >= 0; i--) {
+      if (this.selectedIds.has(entries[i][0]) && !this.selectedIds.has(entries[i + 1][0])) {
+        [entries[i], entries[i + 1]] = [entries[i + 1], entries[i]];
+        swapped = true;
+      }
+    }
+    if (!swapped) return;
+    this.elements = new Map(entries);
+    this.commitReorder(previousOrder);
+  }
+
+  sendBackward(): void {
+    if (this.selectedIds.size === 0) return;
+    const previousOrder = [...this.elements.keys()];
+    const entries = [...this.elements.entries()];
+    let swapped = false;
+    for (let i = 1; i < entries.length; i++) {
+      if (this.selectedIds.has(entries[i][0]) && !this.selectedIds.has(entries[i - 1][0])) {
+        [entries[i - 1], entries[i]] = [entries[i], entries[i - 1]];
+        swapped = true;
+      }
+    }
+    if (!swapped) return;
+    this.elements = new Map(entries);
+    this.commitReorder(previousOrder);
   }
 
   setTheme(theme: Theme): void {
@@ -2167,14 +2205,13 @@ export class DrawingController {
       switch (change.type) {
         case "create":
         case "update": {
-          this.elements.set(change.element.id, change.element);
           const existing = this.svgById(change.element.id);
           if (existing) {
+            this.elements.set(change.element.id, change.element);
             const newEl = this.renderElement(change.element);
             if (newEl) { existing.replaceWith(newEl); this.measureTextElement(change.element.id); }
           } else {
-            const svgEl = this.renderElement(change.element);
-            if (svgEl && this.elementsGroup) this.elementsGroup.appendChild(svgEl);
+            this.insertElement(change.element);
             this.measureTextElement(change.element.id);
           }
           affectedIds.add(change.element.id);

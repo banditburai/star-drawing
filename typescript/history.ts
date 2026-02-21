@@ -6,7 +6,6 @@ import type {
 } from "./types.js";
 import { cloneElement, isLine, isPath, isShape, isText } from "./types.js";
 
-// The MovePosition discriminant ("x" vs "points") must match the element type.
 function applyMovePosition(el: DrawingElement, pos: MovePosition): void {
   if ("x" in pos && (isShape(el) || isText(el))) {
     el.x = pos.x;
@@ -26,6 +25,7 @@ function applyMovePosition(el: DrawingElement, pos: MovePosition): void {
 export interface HistoryResult {
   elementsToSet: Array<[string, DrawingElement]>;
   elementsToDelete: string[];
+  orderToApply?: string[];
 }
 
 export function processHistory(
@@ -71,6 +71,10 @@ export function processHistory(
       for (const item of action.data) {
         result.elementsToSet.push([item.id, isUndo ? item.before : item.after]);
       }
+      break;
+
+    case "reorder":
+      result.orderToApply = isUndo ? action.before : action.after;
       break;
   }
 

@@ -259,4 +259,5 @@ export type UndoAction =
         after: MovePosition;
       }>;
     }
-  | { action: "modify"; data: Array<{ id: string; before: DrawingElement; after: DrawingElement }> };
+  | { action: "modify"; data: Array<{ id: string; before: DrawingElement; after: DrawingElement }> }
+  | { action: "reorder"; before: string[]; after: string[] };

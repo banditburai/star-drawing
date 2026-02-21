@@ -7,4 +7,5 @@ export * from "./history.js";
 export { DrawingController } from "./controller.js";
 export type { DrawingCallbacks } from "./controller.js";
 export { parseSvgToElements } from "./svg-import.js";
+export type { SvgImportResult } from "./svg-import.js";
 export { prefetchFonts, fetchFontCSS, buildFontStyleForExport } from "./fonts.js";
