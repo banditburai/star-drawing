@@ -464,7 +464,6 @@ export function renderText(el: TextElement, theme: Theme, textBounds?: TextBound
   text.setAttribute("font-size", String(el.font_size));
   text.setAttribute("font-family", fontFamilyMap[el.font_family] ?? fontFamilyMap.normal);
   text.setAttribute("text-anchor", textAnchorMap[el.text_align] ?? "start");
-  text.setAttribute("dominant-baseline", "text-before-edge");
   text.setAttribute("opacity", String(el.opacity));
   text.setAttribute("data-font-family", el.font_family);
   if (isToken(el.stroke_color)) text.setAttribute("data-stroke-token", el.stroke_color);
@@ -475,15 +474,18 @@ export function renderText(el: TextElement, theme: Theme, textBounds?: TextBound
     ? wrapTextToLines(el.text, el.width, el.font_size, el.font_family)
     : el.text.split("\n");
 
+  // dy offset instead of dominant-baseline — renders identically in inline
+  // and standalone SVG (dominant-baseline does not)
   if (lines.length > 1) {
     for (let i = 0; i < lines.length; i++) {
       const tspan = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
       tspan.setAttribute("x", String(el.x));
-      tspan.setAttribute("dy", i === 0 ? "0" : "1.2em");
+      tspan.setAttribute("dy", i === 0 ? "1em" : "1.2em");
       tspan.textContent = lines[i];
       text.appendChild(tspan);
     }
   } else {
+    text.setAttribute("dy", "1em");
     text.textContent = el.text;
   }
 
